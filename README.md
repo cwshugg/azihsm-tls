@@ -7,3 +7,13 @@ AziHSM supports a variety of customer scenarios.
 However, throughout our testing and development, one scenario we haven't visited is using AziHSM to manage keys for a [**Transport Layer Security**](https://www.cloudflare.com/learning/ssl/transport-layer-security-tls/) (**TLS**) server.
 This project aims to explore that scenario; this repository contains the files and code from our 2026 hackathon project.
 
+## Project Agenda
+
+| **Task** | **Status** | **Description** |
+|----------|------------|-----------------|
+| Research TLS | 🔳 Todo | Gain a basic understanding of TLS; how it works, what keys and certificates are used. Start to form an idea of what a AziHSM-enabled TLS server would look like. |
+| Research Windows API | 🔳 Todo | Study the Windows cryptographic API; understand what API calls our PoC TLS server would need to make to perform TLS operations, and to communicate with AziHSM. |
+| Develop PoC TLS Server+Client | 🔳 Todo | Create a basic command-line TLS server and client (preferably in Rust) that we can use to have two AziHSM-enabled Azure VMs talk to each other. |
+| Test cross-VM communication with TLS server+client | 🔳 Todo | |
+| Record demonstration of cross-VM TLS communication | 🔳 Todo | |
+
