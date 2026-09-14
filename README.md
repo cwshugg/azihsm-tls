@@ -9,11 +9,24 @@ This project aims to explore that scenario; this repository contains the files a
 
 ## Project Agenda
 
+The end goal of this project is to demonstrate a three-VM setup, where each VM uses a separate AziHSM device to enable TLS communication:
+
+1. **VM 1** - Implement a basic **Mock CA** (**Certificate Authority**).
+    * This Mock CA will use the AziHSM device to issue a mock certificate to our TLS Server.
+2. **VM 2** - Implement a basic **TLS Server**.
+    * This TLS Server will communicate with the Mock CA to receive a certificate and associate it with its own public/private key pair, with which it enables secure communication with a TLS Client.
+3. **VM 3** - Implement a basic **TLS Client**.
+    * This TLS Client will reach out to the TLS Server for secure communication.
+
+### Tasks
+
 | **Task** | **Status** | **Description** |
 |----------|------------|-----------------|
-| Research TLS | 🔳 Todo | Gain a basic understanding of TLS; how it works, what keys and certificates are used. Start to form an idea of what a AziHSM-enabled TLS server would look like. |
-| Research Windows API | 🔳 Todo | Study the Windows cryptographic API; understand what API calls our PoC TLS server would need to make to perform TLS operations, and to communicate with AziHSM. |
-| Develop PoC TLS Server+Client | 🔳 Todo | Create a basic command-line TLS server and client (preferably in Rust) that we can use to have two AziHSM-enabled Azure VMs talk to each other. |
-| Test cross-VM communication with TLS server+client | 🔳 Todo | |
-| Record demonstration of cross-VM TLS communication | 🔳 Todo | |
+| Implement Mock CLA | TODO | |
+| Implement TLS Server | TODO | |
+| Test TLS-Server-to-Mock-CLA certificate issuing | TODO |
+| Implement TLS Client | TODO | |
+| Test TLS-Client-to-TLS-Server communication | TODO | |
+| Test full workflow | TODO | |
+| Record demonstration of full workflow | TODO | |
 
