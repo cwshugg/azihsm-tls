@@ -34,4 +34,6 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 
 * **Certificate Authorities** (**CA**)
     * [What is a certificate authority?](https://www.youtube.com/watch?v=8ItJ-VqYo_s)
+    * [Security-AzureConfidentialVM - `WincryptX509.cpp`](https://msazure.visualstudio.com/One/_git/Security-AzureConfidentialVM?path=%2Fsrc%2FSecretsProvisioningLibrary%2FWindows%2FWincryptX509.cpp) - Demonstration of using Windows APIs to construct, sign, load, and validate X509 certs.
+    * [azure-cli-extensions - `create_certchain.sh`](https://github.com/Azure/azure-cli-extensions/blob/main/src/confcom/samples/certs/create_certchain.sh) - Shell script that uses OpenSSL on Linux to generate a certificate chain.
 
