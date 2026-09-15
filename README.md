@@ -30,3 +30,8 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 | Test full workflow | TODO | |
 | Record demonstration of full workflow | TODO | |
 
+## Learning Resources
+
+* **Certificate Authorities** (**CA**)
+    * [What is a certificate authority?](https://www.youtube.com/watch?v=8ItJ-VqYo_s)
+
