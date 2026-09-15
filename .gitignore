@@ -1,0 +1,7 @@
+# Vim swapfiles
+.*.swp
+.*.swo
+.*.swn
+
+# Rust artifacts
+/target/

@@ -1,0 +1,30 @@
+[package]
+name = "azihsm-ca"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Persistent Windows-only AziHSM demonstration certificate authority"
+repository = "https://github.com/cwshugg/azihsm-tls"
+
+[target.'cfg(windows)'.dependencies]
+httparse = { version = "=1.10.1", default-features = false }
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.143"
+time = { version = "=0.3.41", default-features = false, features = [
+    "std",
+    "formatting",
+    "parsing",
+] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
