@@ -1,15 +1,14 @@
 [package]
-name = "azihsm-ca"
+name = "azihsm-ca-demo"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
-description = "Persistent Windows-only AziHSM demonstration certificate authority"
+description = "Windows-only AziHSM TLS certificate enrollment demonstration"
 repository = "https://github.com/cwshugg/azihsm-tls"
 
 [dependencies]
 azihsm-ncrypt = { path = "../azihsm-ncrypt" }
-actix-web = { version = "=4.15.0", default-features = false }
 clap = { version = "=4.6.7", default-features = false, features = [
     "derive",
     "std",
@@ -17,27 +16,22 @@ clap = { version = "=4.6.7", default-features = false, features = [
     "usage",
     "error-context",
 ] }
+pem = "=3.0.6"
 rcgen = { version = "=0.14.10", default-features = false }
 ring = { version = "=0.17.14", default-features = false, features = ["std"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-time = { version = "=0.3.55", default-features = false, features = [
-    "std",
-    "formatting",
-    "parsing",
-] }
-tokio = { version = "=1.53.1", default-features = false, features = ["sync", "time"] }
+time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+ureq = { version = "=3.4.2", default-features = false }
 x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }

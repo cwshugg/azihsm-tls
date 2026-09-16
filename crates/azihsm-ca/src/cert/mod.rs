@@ -5,7 +5,7 @@ pub mod signer;
 use crate::crypto::{hash_sha1, public_point};
 use crate::error::{Error, ErrorClass, Result};
 use crate::policy::CLOCK_SKEW_SECONDS;
-use crate::win::ncrypt::AziKey;
+use crate::win::ncrypt::AzihsmKey;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyIdMethod, KeyUsagePurpose, SanType, SerialNumber,
@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-use signer::{AziHsmSigningKey, PublicP256Key};
+use signer::{AzihsmSigningKey, PublicP256Key};
 
 #[derive(Debug, Clone)]
 pub struct CertificateBacking {
@@ -108,8 +108,8 @@ impl CertificateBacking {
         Ok(parse(&der)?.tbs_certificate.as_ref().to_vec())
     }
 
-    pub fn sign(&self, key: &AziKey) -> Result<Vec<u8>> {
-        let signing_key = AziHsmSigningKey::new(key, &key.public_blob()?)?;
+    pub fn sign(&self, key: &AzihsmKey) -> Result<Vec<u8>> {
+        let signing_key = AzihsmSigningKey::new(key, &key.public_blob()?)?;
         let result = if self.params.is_ca == IsCa::Ca(BasicConstraints::Constrained(0)) {
             self.params.self_signed(&signing_key)
         } else {

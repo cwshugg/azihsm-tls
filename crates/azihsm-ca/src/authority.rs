@@ -18,7 +18,7 @@ use crate::state::{
 use crate::win::crypt32::{
     CertContext, spki_der_from_blob, verify_certificate_signature, verify_exclusive_chain,
 };
-use crate::win::ncrypt::{AziKey, AziProvider, E_UNEXPECTED_STATUS};
+use crate::win::ncrypt::{AzihsmKey, AzihsmProvider, E_UNEXPECTED_STATUS};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,7 +32,7 @@ pub struct LoadedAuthority {
     pub state_dir: PathBuf,
     pub authority: Authority,
     pub root_der: Vec<u8>,
-    pub key: AziKey,
+    pub key: AzihsmKey,
 }
 
 #[derive(Debug)]
@@ -132,7 +132,7 @@ fn fresh_init(
     }
     assert_empty_product_namespaces(state_dir)?;
     publish_state_format(state_dir)?;
-    let provider = AziProvider::open_named(&provider_name)?;
+    let provider = AzihsmProvider::open_named(&provider_name)?;
     provider.require_absent(&key_name)?;
     let operation_id = hex(&random::<16>()?);
     let journal = active.join(&operation_id);
@@ -215,7 +215,7 @@ fn reconcile(state_dir: &Path, operation_id: &str) -> Result<()> {
         .last()
         .cloned()
         .ok_or_else(|| Error::new(ErrorClass::Precondition, "empty journal"))?;
-    let provider = AziProvider::open_named(&last.provider)?;
+    let provider = AzihsmProvider::open_named(&last.provider)?;
     let key = provider.open_key(&last.key_name).map_err(|status| {
         Error::new(
             ErrorClass::Provider,
@@ -407,7 +407,7 @@ fn root_backing_from_intent(
 fn ensure_journal_root(
     journal: &Path,
     intent: &RootSigningIntent,
-    key: &AziKey,
+    key: &AzihsmKey,
     public_blob: &[u8; 72],
 ) -> Result<Vec<u8>> {
     let generation = InitGeneration {
@@ -446,7 +446,7 @@ fn ensure_journal_root(
 fn validate_journal_root(
     root_der: &[u8],
     intent: &RootSigningIntent,
-    key: &AziKey,
+    key: &AzihsmKey,
     public_blob: &[u8; 72],
 ) -> Result<()> {
     let tbs = crate::cert::certificate_tbs(root_der)?;
@@ -533,7 +533,7 @@ fn validate_init_publication(
     publication: &InitPublication,
     operation_id: &str,
     generation: &InitGeneration,
-    key: &AziKey,
+    key: &AzihsmKey,
     public_blob: &[u8; 72],
 ) -> Result<()> {
     if publication.schema_version != SCHEMA_VERSION
@@ -569,7 +569,7 @@ fn validate_init_publication(
 fn publish_init_transaction(
     state_dir: &Path,
     publication: &InitPublication,
-    key: &AziKey,
+    key: &AzihsmKey,
 ) -> Result<()> {
     let public_blob = key.public_blob()?;
     let generation = InitGeneration {
@@ -661,7 +661,7 @@ fn abandon(state_dir: &Path, operation_id: &str) -> Result<()> {
     let last = generations
         .last()
         .ok_or_else(|| Error::new(ErrorClass::Precondition, "empty journal"))?;
-    let provider = AziProvider::open_named(&last.provider)?;
+    let provider = AzihsmProvider::open_named(&last.provider)?;
     provider.require_absent(&last.key_name)?;
     let mut writer = JournalWriter::resume(
         state_dir
@@ -713,7 +713,7 @@ pub fn load_for_serve(state_dir: &Path) -> Result<LoadedAuthority> {
         ));
     }
 
-    let provider = AziProvider::open_named(&authority.provider)?;
+    let provider = AzihsmProvider::open_named(&authority.provider)?;
     let key = provider.open_key(&authority.key_name).map_err(|status| {
         Error::new(
             ErrorClass::Provider,
@@ -1003,7 +1003,7 @@ pub fn quarantine(state_dir: &Path, issuance_id: &str) -> Result<()> {
         } else {
             let authority: Authority = read_json(&state_dir.join("authority.json"), AUTHORITY_CAP)?;
             let root_der = read_bounded(&state_dir.join("root.der"), ROOT_CAP)?;
-            let provider = AziProvider::open_named(&authority.provider)?;
+            let provider = AzihsmProvider::open_named(&authority.provider)?;
             let key = provider.open_key(&authority.key_name).map_err(|status| {
                 Error::new(
                     ErrorClass::Provider,

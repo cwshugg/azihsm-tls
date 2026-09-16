@@ -1,24 +1,9 @@
 //! Safe ownership wrappers and Windows cryptography operations.
 
 pub mod crypt32;
-pub mod handles;
 pub mod ncrypt;
 
 use crate::error::{Error, ErrorClass};
-
-pub(crate) fn status_error(class: ErrorClass, operation: &str, status: i32) -> Error {
-    if operation.starts_with("NCrypt") {
-        tracing::error!(
-            event = "ncrypt_operation_failed",
-            operation,
-            status = format_args!("0x{:08x}", status as u32)
-        );
-    }
-    Error::new(
-        class,
-        format!("{operation} failed with status 0x{:08x}", status as u32),
-    )
-}
 
 pub(crate) fn bool_error(class: ErrorClass, operation: &str) -> Error {
     // SAFETY: GetLastError has no preconditions and is called immediately after a BOOL failure.

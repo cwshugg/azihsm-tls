@@ -28,6 +28,14 @@ fn product_has_no_prohibited_dependencies_or_fault_controls() {
     }
     let mut source = String::new();
     collect_rs(&root.join("src"), &mut source);
+    collect_rs(
+        &root
+            .parent()
+            .unwrap_or_else(|| panic!("crate has no workspace parent"))
+            .join("azihsm-ncrypt")
+            .join("src"),
+        &mut source,
+    );
     for prohibited in [
         "NCRYPT_OVERWRITE_KEY_FLAG",
         "NCRYPT_MACHINE_KEY_FLAG",

@@ -3,7 +3,7 @@
 #![cfg(windows)]
 
 use azihsm_ca::policy::PROVIDER_NAME;
-use azihsm_ca::win::ncrypt::AziProvider;
+use azihsm_ca::win::ncrypt::AzihsmProvider;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -11,7 +11,6 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use windows_sys::Win32::Security::Cryptography::NCryptDeleteKey;
 
 const EXE: &str = env!("CARGO_BIN_EXE_azihsm-ca");
 
@@ -103,14 +102,12 @@ fn enrollment_survives_server_restart() {
             "sensitive value appeared in stdout log"
         );
     }
-    let provider = AziProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
-    let mut key = provider
+    let provider =
+        AzihsmProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
+    let key = provider
         .open_key(&key_name)
         .unwrap_or_else(|status| panic!("key reopen failed: 0x{:08x}", status as u32));
-    // SAFETY: this test exclusively owns the collision-resistant name.
-    let delete = unsafe { NCryptDeleteKey(key.key.0, 0) };
-    assert!(delete >= 0, "key delete failed: 0x{:08x}", delete as u32);
-    key.key.disarm();
+    key.delete().unwrap_or_else(|error| panic!("{error}"));
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("{error}"));
     println!(
         "PASS: HTTP 201, restart, HTTP 200 byte-identical replay, runtime fail-closed readiness and recovery, checked key cleanup"

@@ -7,12 +7,11 @@ use azihsm_ca::state::{
     Authority, IssuanceIntent, SCHEMA_VERSION, SerialReservation, create_protected_dir,
     durable_bytes, durable_json,
 };
-use azihsm_ca::win::ncrypt::AziProvider;
+use azihsm_ca::win::ncrypt::AzihsmProvider;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use windows_sys::Win32::Security::Cryptography::NCryptDeleteKey;
 
 const EXE: &str = env!("CARGO_BIN_EXE_azihsm-ca");
 
@@ -69,19 +68,13 @@ fn init_reopen_inspect_and_checked_delete() {
         .status()
         .unwrap_or_else(|error| panic!("inspect failed: {error}"));
     assert!(inspect.success(), "live inspect failed with {inspect}");
-    let provider = AziProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
-    let mut key = provider
+    let provider =
+        AzihsmProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
+    let key = provider
         .open_key(&key_name)
         .unwrap_or_else(|status| panic!("reopen failed: 0x{:08x}", status as u32));
     key.kat().unwrap_or_else(|error| panic!("{error}"));
-    // SAFETY: the collision-resistant key name and state are owned by this test.
-    let status = unsafe { NCryptDeleteKey(key.key.0, 0) };
-    assert!(
-        status >= 0,
-        "checked delete failed: 0x{:08x}",
-        status as u32
-    );
-    key.key.disarm();
+    key.delete().unwrap_or_else(|error| panic!("{error}"));
     assert!(
         provider.open_key(&key_name).is_err(),
         "test key still opens"
@@ -371,14 +364,12 @@ fn cleanup_failed_test_authority() {
             || key_name.starts_with("azihsm-ca-precommit-"),
         "refusing non-test key"
     );
-    let provider = AziProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
-    let mut key = provider
+    let provider =
+        AzihsmProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
+    let key = provider
         .open_key(key_name)
         .unwrap_or_else(|status| panic!("reopen failed: 0x{:08x}", status as u32));
-    // SAFETY: both state path and collision-resistant key prefix prove test ownership.
-    let status = unsafe { NCryptDeleteKey(key.key.0, 0) };
-    assert!(status >= 0, "delete failed: 0x{:08x}", status as u32);
-    key.key.disarm();
+    key.delete().unwrap_or_else(|error| panic!("{error}"));
     let removal = if state.to_string_lossy().contains("server-restart-") {
         state
             .parent()
@@ -412,14 +403,12 @@ fn delete_test_key(key_name: &str) {
             || key_name.starts_with("azihsm-ca-precommit-"),
         "refusing non-test key"
     );
-    let provider = AziProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
-    let mut key = provider
+    let provider =
+        AzihsmProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
+    let key = provider
         .open_key(key_name)
         .unwrap_or_else(|status| panic!("reopen failed: 0x{:08x}", status as u32));
-    // SAFETY: the collision-resistant name is owned by this test.
-    let status = unsafe { NCryptDeleteKey(key.key.0, 0) };
-    assert!(status >= 0, "delete failed: 0x{:08x}", status as u32);
-    key.key.disarm();
+    key.delete().unwrap_or_else(|error| panic!("{error}"));
 }
 
 fn text(path: &std::path::Path) -> &str {

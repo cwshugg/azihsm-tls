@@ -4,8 +4,8 @@ This guide runs the Windows-only `azihsm-ca` demonstration server for a
 one-way TLS scenario. It is demo guidance, not production deployment advice.
 For implementation details and the full state model, see the
 [crate README](../crates/azihsm-ca/README.md).
-For reusable TLS-server key generation and enrollment automation, see the
-[PowerShell enrollment scripts](../scripts/README.md).
+For the supported enrollment demonstration, which keeps the TLS key in the
+AziHSM provider, use the [`azihsm-ca-demo` guide](azihsm-ca-demo.md).
 
 ## Security and cryptographic boundary
 
@@ -48,7 +48,7 @@ certificate locally.
 * Network reachability from the TLS server to the selected CA listen address
   and port. A non-loopback demo requires an explicit insecure-HTTP flag and an
   appropriate Windows Firewall rule.
-* `certreq.exe` for the PowerShell enrollment example.
+* `certreq.exe` for the manual certificate-request example.
 
 Run build commands from the repository root. Run the executable from any
 working directory, but always pass an absolute `--state-dir`. The examples
@@ -335,12 +335,12 @@ Important error statuses are:
 When unready, `/livez` remains `200`, while `/readyz` and state-dependent
 routes return `503` with `ca_not_ready`.
 
-## One-way TLS enrollment
+## Manual enrollment API contract
 
-The copy/paste workflow below documents the API contract directly. For
-validated two-stage automation with persistent idempotency and explicit
-CurrentUser/LocalMachine handling, use the
-[TLS server enrollment scripts](../scripts/README.md).
+The supported and recommended enrollment client is
+[`azihsm-ca-demo`](azihsm-ca-demo.md). The lower-level PowerShell workflow below
+is retained only as an independently useful illustration of the HTTP API and
+Windows certificate-store operations.
 
 ### 1. Generate the TLS server key and CSR
 
