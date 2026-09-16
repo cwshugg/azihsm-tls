@@ -49,7 +49,11 @@ pub struct DeleteKeyArgs {
 }
 
 pub fn create(args: CreateArgs) -> Result<()> {
-    tracing::info!(event = "command_started", command = "create");
+    tracing::info!(
+        event = "command_started",
+        command = "create",
+        message = "Creating one named AziHSM key, CSR, and verified public certificate identity."
+    );
     validate_sans(&args.dns, &args.ip).map_err(usage)?;
     let staging = prepare_staging(&args)?;
     if args.output_dir.join(FINALIZE_FAILED).exists() {
@@ -62,7 +66,11 @@ pub fn create(args: CreateArgs) -> Result<()> {
     let finalize_marker = args.output_dir.join(FINALIZE_STARTED);
     let key = match provider.open_key(&staging.key_name) {
         Ok(key) if finalize_marker.exists() => {
-            tracing::info!(event = "key_recovery_started");
+            tracing::info!(
+                event = "key_recovery_started",
+                message =
+                    "Recovering the same finalized named key from its durable staging record."
+            );
             key
         }
         Ok(_) => {
@@ -73,7 +81,10 @@ pub fn create(args: CreateArgs) -> Result<()> {
         }
         Err(_) => {
             provider.require_absent(&staging.key_name)?;
-            tracing::info!(event = "key_creation_started");
+            tracing::info!(
+                event = "key_creation_started",
+                message = "Creating a named P-256 key inside AziHSM; private key bytes never leave the provider."
+            );
             let key = provider.create_named_staged(&staging.key_name)?;
             files::publish_json(&finalize_marker, &staging)?;
             let status = key.finalize();
@@ -87,15 +98,24 @@ pub fn create(args: CreateArgs) -> Result<()> {
                     ),
                 ));
             }
-            tracing::info!(event = "key_finalized");
+            tracing::info!(
+                event = "key_finalized",
+                message = "The named AziHSM key is finalized and remains non-exportable."
+            );
             key
         }
     };
     key.kat()?;
-    tracing::info!(event = "public_key_export_started");
+    tracing::info!(
+        event = "public_key_export_started",
+        message = "Exporting only the public key so certificates and signatures can be verified."
+    );
     let public_blob = key.public_blob()?;
     let spki = csr::spki_der(&public_blob)?;
-    tracing::info!(event = "public_key_export_completed");
+    tracing::info!(
+        event = "public_key_export_completed",
+        message = "The public key was exported; no private key bytes or handles were exposed."
+    );
     publish_public_key(&args.output_dir, &spki)?;
     let csr_der = load_or_create_csr(&args.output_dir, &staging, &key, &public_blob, &spki)?;
     let metadata = RequestMetadata {
@@ -116,10 +136,18 @@ pub fn create(args: CreateArgs) -> Result<()> {
     };
     files::publish_json(&args.output_dir.join(REQUEST_METADATA), &metadata)?;
     transcript::local_json("written", REQUEST_METADATA, &metadata)?;
-    tracing::info!(event = "artifact_published", artifact = "request_metadata");
+    tracing::info!(
+        event = "artifact_published",
+        artifact = "request_metadata",
+        message =
+            "Published immutable public request metadata that references the named AziHSM key."
+    );
     files::remove(&args.output_dir.join(FINALIZE_STARTED))?;
     files::remove(&args.output_dir.join(STAGING_METADATA))?;
-    tracing::info!(event = "staging_cleanup_completed");
+    tracing::info!(
+        event = "staging_cleanup_completed",
+        message = "Removed temporary recovery markers after durable public identity metadata was published."
+    );
     enroll_and_publish(
         &args.output_dir,
         &metadata,
@@ -127,12 +155,20 @@ pub fn create(args: CreateArgs) -> Result<()> {
         &csr_der,
         &args.retry_guidance,
     )?;
-    tracing::info!(event = "command_completed", command = "create");
+    tracing::info!(
+        event = "command_completed",
+        command = "create",
+        message = "The named AziHSM identity and verified public certificate artifacts are ready."
+    );
     Ok(())
 }
 
 pub fn retry(args: RetryArgs) -> Result<()> {
-    tracing::info!(event = "command_started", command = "retry");
+    tracing::info!(
+        event = "command_started",
+        command = "retry",
+        message = "Retrying enrollment with the existing key, CSR, and idempotency key instead of creating a second identity."
+    );
     files::validate_output_dir(&args.output_dir)?;
     let metadata = load_request(&args.output_dir)?;
     for stale in [FINALIZE_STARTED, STAGING_METADATA] {
@@ -142,7 +178,10 @@ pub fn retry(args: RetryArgs) -> Result<()> {
         }
     }
     let provider = open_provider()?;
-    tracing::info!(event = "key_open_started");
+    tracing::info!(
+        event = "key_open_started",
+        message = "Opening the recorded named key in AziHSM to prove the retry still uses the same identity."
+    );
     let key = provider.open_key(&metadata.key_name).map_err(|status| {
         Error::new(
             ErrorClass::Provider,
@@ -150,17 +189,14 @@ pub fn retry(args: RetryArgs) -> Result<()> {
         )
     })?;
     key.kat()?;
-    tracing::info!(event = "key_open_completed");
+    log_key_open_completed();
     let spki = csr::spki_der(&key.public_blob()?)?;
-    if hex(&hash_sha256(&spki)?) != metadata.spki_sha256
-        || files::read_bounded(&args.output_dir.join(PUBLIC_DER), 4096)? != spki
-    {
-        return Err(validation(
-            "stored public-key identity does not match the named key",
-        ));
-    }
+    let stored_spki = files::read_bounded(&args.output_dir.join(PUBLIC_DER), 4096)?;
+    verify_opened_key_identity(&metadata, &spki, &stored_spki)?;
     let csr_der = files::read_bounded(&args.output_dir.join(CSR_DER), 16_384)?;
-    validate_request_material(&metadata, &spki, &csr_der)?;
+    validate_csr_and_log(false, || {
+        validate_request_material(&metadata, &spki, &csr_der)
+    })?;
     enroll_and_publish(
         &args.output_dir,
         &metadata,
@@ -168,12 +204,46 @@ pub fn retry(args: RetryArgs) -> Result<()> {
         &csr_der,
         &args.retry_guidance,
     )?;
-    tracing::info!(event = "command_completed", command = "retry");
+    tracing::info!(
+        event = "command_completed",
+        command = "retry",
+        message = "The existing identity completed replay-safe enrollment without generating a second key or CSR."
+    );
+    Ok(())
+}
+
+fn log_key_open_completed() {
+    tracing::info!(
+        event = "key_open_completed",
+        message = "The recorded named AziHSM key handle was opened."
+    );
+}
+
+fn verify_opened_key_identity(
+    metadata: &RequestMetadata,
+    spki: &[u8],
+    stored_spki: &[u8],
+) -> Result<()> {
+    if hex(&hash_sha256(spki)?) != metadata.spki_sha256 || stored_spki != spki {
+        return Err(validation(
+            "stored public-key identity does not match the named key",
+        ));
+    }
+    tracing::info!(
+        event = "key_identity_verified",
+        message =
+            "The opened AziHSM key public SPKI matches both the stored DER and recorded digest."
+    );
     Ok(())
 }
 
 pub fn show(args: OutputArgs) -> Result<()> {
-    tracing::info!(event = "command_started", command = "show");
+    tracing::info!(
+        event = "command_started",
+        command = "show",
+        message =
+            "Showing public certificate metadata and the non-exportable AziHSM key reference."
+    );
     files::validate_output_dir(&args.output_dir)?;
     let request = load_request(&args.output_dir)?;
     validate_stored_request(&args.output_dir, &request)?;
@@ -201,12 +271,20 @@ pub fn show(args: OutputArgs) -> Result<()> {
         "Key deletion: {}",
         deletion_status(&args.output_dir, &request)?
     );
-    tracing::info!(event = "command_completed", command = "show");
+    tracing::info!(
+        event = "command_completed",
+        command = "show",
+        message = "Finished displaying public identity information; the referenced private key remains in AziHSM."
+    );
     Ok(())
 }
 
 pub fn delete_key(args: DeleteKeyArgs) -> Result<()> {
-    tracing::info!(event = "command_started", command = "delete-key");
+    tracing::info!(
+        event = "command_started",
+        command = "delete-key",
+        message = "Verifying the recorded public identity before irreversibly deleting the exact named AziHSM key."
+    );
     files::validate_output_dir(&args.output_dir)?;
     let metadata = load_request(&args.output_dir)?;
     let stored_spki = validate_stored_request(&args.output_dir, &metadata)?;
@@ -227,8 +305,16 @@ pub fn delete_key(args: DeleteKeyArgs) -> Result<()> {
         let record: DeletionRecord = files::read_json(&args.output_dir.join(DELETION_RECORD))?;
         validate_deletion_record(&record, &metadata, &intent)?;
         transcript::local_json("read", DELETION_RECORD, &record)?;
-        tracing::info!(event = "key_deletion_completed");
-        tracing::info!(event = "command_completed", command = "delete-key");
+        tracing::info!(
+            event = "key_deletion_completed",
+            message =
+                "The durable deletion record confirms the exact named key was already deleted."
+        );
+        tracing::info!(
+            event = "command_completed",
+            command = "delete-key",
+            message = "Key deletion is complete and recoverable evidence remains in the public state directory."
+        );
         return Ok(());
     }
     let provider = open_provider()?;
@@ -241,8 +327,15 @@ pub fn delete_key(args: DeleteKeyArgs) -> Result<()> {
         || provider.require_absent(&metadata.key_name),
         None,
     )?;
-    tracing::info!(event = "key_deletion_completed");
-    tracing::info!(event = "command_completed", command = "delete-key");
+    tracing::info!(
+        event = "key_deletion_completed",
+        message = "The exact named AziHSM key is deleted and its absence is durably recorded."
+    );
+    tracing::info!(
+        event = "command_completed",
+        command = "delete-key",
+        message = "Key deletion is complete and recoverable evidence remains in the public state directory."
+    );
     Ok(())
 }
 
@@ -305,14 +398,20 @@ where
             };
             files::publish_json(&output_dir.join(DELETION_INTENT), &intent)?;
             transcript::local_json("written", DELETION_INTENT, &intent)?;
-            tracing::info!(event = "deletion_intent_published");
+            tracing::info!(
+                event = "deletion_intent_published",
+                message = "Published an identity-bound deletion intent so an interrupted irreversible delete can be safely replayed."
+            );
             fail_deletion(fault, DeletionFault::AfterIntent)?;
             intent
         }
     };
 
     if inspect()? {
-        tracing::info!(event = "key_deletion_started");
+        tracing::info!(
+            event = "key_deletion_started",
+            message = "Irreversibly deleting the exact named key after its public identity and confirmation matched."
+        );
         delete()?;
         fail_deletion(fault, DeletionFault::AfterDelete)?;
     }
@@ -526,7 +625,10 @@ fn publish_new_staging(args: &CreateArgs) -> Result<StagingRecord> {
     };
     files::publish_json(&args.output_dir.join(STAGING_METADATA), &staging)?;
     transcript::local_json("written", STAGING_METADATA, &staging)?;
-    tracing::info!(event = "staging_record_published");
+    tracing::info!(
+        event = "staging_record_published",
+        message = "Published recoverable public staging metadata before finalizing the named key."
+    );
     Ok(staging)
 }
 
@@ -539,10 +641,13 @@ fn load_or_create_csr(
 ) -> Result<Vec<u8>> {
     let path = output_dir.join(CSR_DER);
     let ips = parse_ips(&staging.ip_sans)?;
-    let csr_der = if path.exists() {
-        files::read_bounded(&path, 16_384)?
+    let (csr_der, generated) = if path.exists() {
+        (files::read_bounded(&path, 16_384)?, false)
     } else {
-        tracing::info!(event = "csr_generation_started");
+        tracing::info!(
+            event = "csr_generation_started",
+            message = "Building a public CSR and signing its proof of possession with the non-exportable AziHSM key."
+        );
         let bytes = csr::build(
             key,
             public_blob,
@@ -555,11 +660,28 @@ fn load_or_create_csr(
             &output_dir.join(CSR_PEM),
             pem::encode(&pem::Pem::new("CERTIFICATE REQUEST", bytes.clone())).as_bytes(),
         )?;
-        tracing::info!(event = "csr_generation_completed");
-        bytes
+        (bytes, true)
     };
-    csr::validate(&csr_der, spki, &staging.subject_cn, &staging.dns_sans, &ips)?;
+    validate_csr_and_log(generated, || {
+        csr::validate(&csr_der, spki, &staging.subject_cn, &staging.dns_sans, &ips)
+    })?;
     Ok(csr_der)
+}
+
+fn validate_csr_and_log(generated: bool, validate: impl FnOnce() -> Result<()>) -> Result<()> {
+    validate()?;
+    if generated {
+        tracing::info!(
+            event = "csr_generation_completed",
+            message = "The generated CSR proof of possession is valid and contains only the requested identity fields."
+        );
+    } else {
+        tracing::info!(
+            event = "csr_validation_completed",
+            message = "The existing CSR was reused after its proof of possession and requested identity fields were validated."
+        );
+    }
+    Ok(())
 }
 
 fn publish_public_key(output_dir: &Path, spki: &[u8]) -> Result<()> {
@@ -568,7 +690,11 @@ fn publish_public_key(output_dir: &Path, spki: &[u8]) -> Result<()> {
         &output_dir.join(PUBLIC_PEM),
         pem::encode(&pem::Pem::new("PUBLIC KEY", spki)).as_bytes(),
     )?;
-    tracing::info!(event = "artifact_published", artifact = "public_key");
+    tracing::info!(
+        event = "artifact_published",
+        artifact = "public_key",
+        message = "Published DER and PEM public-key files; they contain no private key material."
+    );
     Ok(())
 }
 
@@ -625,7 +751,9 @@ fn enroll_and_publish(
     }
     tracing::info!(
         event = "issuance_artifacts_published",
-        issuance_id = issuance.issuance_id
+        issuance_id = issuance.issuance_id,
+        message =
+            "Published the verified leaf, public root, chain, and issuance metadata artifacts."
     );
     Ok(())
 }
@@ -728,9 +856,15 @@ pub fn load_request(output_dir: &Path) -> Result<RequestMetadata> {
 }
 
 fn open_provider() -> Result<AzihsmProvider> {
-    tracing::info!(event = "provider_open_started");
+    tracing::info!(
+        event = "provider_open_started",
+        message = "Opening the current-user AziHSM key storage provider."
+    );
     let provider = AzihsmProvider::open_named(PROVIDER_NAME)?;
-    tracing::info!(event = "provider_open_completed");
+    tracing::info!(
+        event = "provider_open_completed",
+        message = "The AziHSM provider is open for named-key operations without software fallback."
+    );
     Ok(provider)
 }
 
@@ -780,9 +914,68 @@ fn usage(message: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Metadata, Subscriber};
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+    static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone)]
+    struct EventCapture(Arc<Mutex<Vec<String>>>);
+
+    struct EventVisitor<'a>(&'a Arc<Mutex<Vec<String>>>);
+
+    impl Visit for EventVisitor<'_> {
+        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "event" {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|error| panic!("{error}"))
+                    .push(value.to_owned());
+            }
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(NEXT_SPAN.fetch_add(1, Ordering::Relaxed))
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut EventVisitor(&self.0));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+            Interest::always()
+        }
+    }
+
+    fn capture_events(action: impl FnOnce()) -> Vec<String> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(EventCapture(Arc::clone(&events)), action);
+        events
+            .lock()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .clone()
+    }
 
     #[test]
     fn generated_identifiers_are_lowercase_hex() {
@@ -794,6 +987,57 @@ mod tests {
         let source = include_str!("model.rs");
         assert!(!source.contains("private_key"));
         assert!(!source.contains("pkcs8"));
+    }
+
+    #[test]
+    fn key_identity_narration_follows_comparisons_and_is_absent_on_mismatch() {
+        let mut metadata = deletion_metadata();
+        let spki = b"public-spki";
+        metadata.spki_sha256 = hex(&hash_sha256(spki).unwrap_or_else(|error| panic!("{error}")));
+
+        let success = capture_events(|| {
+            log_key_open_completed();
+            verify_opened_key_identity(&metadata, spki, spki)
+                .unwrap_or_else(|error| panic!("{error}"));
+        });
+        assert_eq!(success, ["key_open_completed", "key_identity_verified"]);
+
+        let failure = capture_events(|| {
+            log_key_open_completed();
+            assert!(verify_opened_key_identity(&metadata, spki, b"different").is_err());
+        });
+        assert_eq!(failure, ["key_open_completed"]);
+    }
+
+    #[test]
+    fn csr_success_narration_follows_validation_and_is_absent_on_failure() {
+        let generated = capture_events(|| {
+            validate_csr_and_log(true, || {
+                tracing::info!(event = "csr_validation_attempted");
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
+        });
+        assert_eq!(
+            generated,
+            ["csr_validation_attempted", "csr_generation_completed"]
+        );
+
+        let reused = capture_events(|| {
+            validate_csr_and_log(false, || Ok(())).unwrap_or_else(|error| panic!("{error}"));
+        });
+        assert_eq!(reused, ["csr_validation_completed"]);
+
+        let failure = capture_events(|| {
+            assert!(
+                validate_csr_and_log(true, || {
+                    tracing::info!(event = "csr_validation_attempted");
+                    Err(validation("invalid CSR"))
+                })
+                .is_err()
+            );
+        });
+        assert_eq!(failure, ["csr_validation_attempted"]);
     }
 
     #[test]

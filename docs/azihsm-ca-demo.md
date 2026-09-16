@@ -235,8 +235,19 @@ default. `RUST_LOG` accepts exactly `off`, `error`, `warn`, `info`, `debug`, or
 `trace`. Invalid values exit with code `2`; module filters and comma-separated
 directives are unsupported.
 
-Tracing reports bounded lifecycle events. The transcript—not tracing—is the
-deliberately verbose record of public request, response, and local metadata.
+Tracing reports a stable `event` field plus a concise `message` for people
+watching the demo. The transcript—not tracing—is the deliberately verbose,
+byte-compatible record of public request, response, and local metadata:
+
+```text
+INFO event="readiness_check_started" message="Checking whether the CA is ready to issue certificates."
+=== HTTP RESPONSE ===
+Method: GET
+Path: /readyz
+Body (JSON):
+{ ... exact public JSON ... }
+=== END HTTP RESPONSE ===
+```
 
 ## Verification
 

@@ -13,6 +13,10 @@ public artifacts and prints a default-on HTTP/local metadata transcript;
 private-key bytes and handles are never exported or printed. RSA generation
 is unsupported.
 
+Operational lines combine stable fields such as `event` with a concise human
+`message`; the complete JSON/PEM transcript remains a separate default-on
+public payload record.
+
 For prerequisites, complete command documentation, artifact descriptions,
 wire transcript examples, retry and deletion behavior, verification rules,
 and demo risks, see the

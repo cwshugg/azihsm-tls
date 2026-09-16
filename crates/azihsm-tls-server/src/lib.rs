@@ -30,7 +30,12 @@ pub fn main_entry() -> std::result::Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Run(args) => {
             ca_cli::validate_sans(&args.dns, &args.ip)?;
-            tracing::info!(event = "command_started", command = "run");
+            tracing::info!(
+                event = "command_started",
+                command = "run",
+                message =
+                    "Preparing one persistent AziHSM identity before starting the TLS listener."
+            );
             let identity = prepare_server_identity(ServerPrepareOptions {
                 state_dir: args.state_dir,
                 dns: args.dns,
@@ -46,17 +51,38 @@ pub fn main_entry() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             runtime.block_on(server::run(args.listen, config, not_after))?;
             drop(identity);
-            tracing::info!(event = "command_completed", command = "run");
+            tracing::info!(
+                event = "command_completed",
+                command = "run",
+                message = "The TLS listener and all connection tasks stopped before releasing the AziHSM identity."
+            );
         }
         Command::Show(args) => {
-            tracing::info!(event = "command_started", command = "show");
+            tracing::info!(
+                event = "command_started",
+                command = "show",
+                message = "Showing the public certificate identity and non-exportable AziHSM key reference."
+            );
             show_server_identity(&args.state_dir)?;
-            tracing::info!(event = "command_completed", command = "show");
+            tracing::info!(
+                event = "command_completed",
+                command = "show",
+                message =
+                    "Finished displaying the public server identity and certificate validity."
+            );
         }
         Command::DeleteKey(args) => {
-            tracing::info!(event = "command_started", command = "delete-key");
+            tracing::info!(
+                event = "command_started",
+                command = "delete-key",
+                message = "Verifying durable identity evidence before irreversibly deleting the exact AziHSM key."
+            );
             delete_server_key(&args.state_dir, args.confirm_key_name)?;
-            tracing::info!(event = "command_completed", command = "delete-key");
+            tracing::info!(
+                event = "command_completed",
+                command = "delete-key",
+                message = "The exact server key is deleted after identity-bound confirmation and absence verification."
+            );
         }
     }
     Ok(())

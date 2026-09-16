@@ -90,7 +90,10 @@ impl CaClient {
 
     pub fn ready_typed(&self) -> std::result::Result<(), CaFailure> {
         let operation = CaOperation::Readiness;
-        tracing::info!(event = "readiness_check_started");
+        tracing::info!(
+            event = "readiness_check_started",
+            message = "Checking whether the CA is ready to issue certificates."
+        );
         let (status, content_type, body) =
             self.get_typed(operation, "/readyz", "application/json", JSON_LIMIT)?;
         transcript::http_response_to(
@@ -113,6 +116,10 @@ impl CaClient {
         let response: ReadyResponse =
             parse_json(&body).map_err(|source| Self::protocol(operation, source))?;
         if response.schema_version != 1 || !response.ready {
+            tracing::warn!(
+                event = "readiness_check_not_ready",
+                message = "The CA is not ready, so certificate issuance cannot safely continue."
+            );
             return Err(CaFailure {
                 kind: if response.schema_version == 1 {
                     CaFailureKind::Availability
@@ -123,7 +130,10 @@ impl CaClient {
                 source: http("CA readiness response was not ready"),
             });
         }
-        tracing::info!(event = "readiness_check_completed");
+        tracing::info!(
+            event = "readiness_check_completed",
+            message = "The CA reports that it is ready to issue certificates."
+        );
         Ok(())
     }
 
@@ -133,7 +143,10 @@ impl CaClient {
 
     pub fn metadata_typed(&self) -> std::result::Result<CaMetadata, CaFailure> {
         let operation = CaOperation::Metadata;
-        tracing::info!(event = "ca_metadata_fetch_started");
+        tracing::info!(
+            event = "ca_metadata_fetch_started",
+            message = "Reading the CA authority identity and supported certificate endpoints."
+        );
         let (status, content_type, body) =
             self.get_typed(operation, "/v1/ca", "application/json", JSON_LIMIT)?;
         transcript::http_response_to(
@@ -165,7 +178,11 @@ impl CaClient {
                 http("CA metadata does not match the supported schema"),
             ));
         }
-        tracing::info!(event = "ca_metadata_fetch_completed");
+        tracing::info!(
+            event = "ca_metadata_fetch_completed",
+            authority_id = metadata.authority_id,
+            message = "The CA authority identity and endpoints match the supported protocol."
+        );
         Ok(metadata)
     }
 
@@ -175,7 +192,11 @@ impl CaClient {
 
     pub fn root_typed(&self) -> std::result::Result<Vec<u8>, CaFailure> {
         let operation = CaOperation::Root;
-        tracing::info!(event = "root_fetch_started");
+        tracing::info!(
+            event = "root_fetch_started",
+            message =
+                "Fetching the public CA root for local verification and client trust provisioning."
+        );
         let (status, content_type, body) = self.get_typed(
             operation,
             "/v1/ca/root",
@@ -206,7 +227,11 @@ impl CaClient {
         }
         require_content_type(content_type.as_deref(), "application/pkix-cert")
             .map_err(|source| Self::protocol(operation, source))?;
-        tracing::info!(event = "root_fetch_completed");
+        tracing::info!(
+            event = "root_fetch_completed",
+            message =
+                "The public CA root was fetched for verification and independent client trust."
+        );
         Ok(body)
     }
 
@@ -231,7 +256,10 @@ impl CaClient {
         recovery_guidance: &str,
     ) -> std::result::Result<Enrollment, CaFailure> {
         let operation = CaOperation::Enrollment;
-        tracing::info!(event = "enrollment_started");
+        tracing::info!(
+            event = "enrollment_started",
+            message = "Submitting the public CSR, which proves key possession without sending the private key; the idempotency key makes retries replay-safe."
+        );
         let url = self.url("/v1/certificates");
         transcript::http_request_to(
             self.transcript.as_ref(),
@@ -327,7 +355,12 @@ impl CaClient {
                 http("CA enrollment response omitted a valid issuance ID"),
             ));
         }
-        tracing::info!(event = "enrollment_completed", issuance_id);
+        let message = if status == 201 {
+            "The CA issued a new certificate for this CSR."
+        } else {
+            "The CA returned the byte-identical certificate from an idempotent retry."
+        };
+        tracing::info!(event = "enrollment_completed", issuance_id, status, message);
         Ok(Enrollment {
             status,
             issuance_id,
@@ -378,6 +411,11 @@ impl CaClient {
     }
 
     fn status_failure(operation: CaOperation, status: u16, body: &[u8]) -> CaFailure {
+        tracing::warn!(
+            event = "ca_request_failed",
+            status,
+            message = "The CA returned an unsuccessful status; the exact bounded response remains in the transcript."
+        );
         CaFailure {
             kind: if (500..=599).contains(&status) {
                 CaFailureKind::Availability
@@ -390,6 +428,10 @@ impl CaClient {
     }
 
     fn protocol(operation: CaOperation, source: Error) -> CaFailure {
+        tracing::warn!(
+            event = "ca_protocol_failed",
+            message = "The CA response did not match the bounded protocol contract, so the client fails closed."
+        );
         CaFailure {
             kind: CaFailureKind::Protocol,
             operation,
@@ -424,6 +466,11 @@ impl CaClient {
             | ureq::Error::BodyStalled => CaFailureKind::Protocol,
             _ => CaFailureKind::Protocol,
         };
+        tracing::warn!(
+            event = "ca_transport_failed",
+            kind = ?kind,
+            message = "The CA exchange failed before a valid response was accepted; availability failures may use an already verified cache, while protocol failures fail closed."
+        );
         CaFailure {
             kind,
             operation,

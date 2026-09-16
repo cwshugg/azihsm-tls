@@ -265,6 +265,19 @@ Tracing is compact, timestamp-free, non-ANSI stdout. `RUST_LOG` accepts only
 CA request/response and local JSON/PEM transcripts remain default-on even
 when tracing is off.
 
+Structured tracing keeps stable fields for tools and adds one short human
+description; payload transcripts remain separate and unchanged:
+
+```text
+INFO event="handshake_completed" connection_id=1 message="The client accepted the server certificate and AziHSM signed CertificateVerify; no client identity was authenticated."
+=== TLS MESSAGE ===
+Connection-ID: 1
+Frame-Sequence: 1
+Direction: received
+...
+=== END TLS MESSAGE ===
+```
+
 Application message transcripts are also deterministic and include
 connection ID, frame sequence, direction, exact byte length, encoding, and
 the complete content. Valid UTF-8 is printed as text; other bytes use standard

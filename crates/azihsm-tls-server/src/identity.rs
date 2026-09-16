@@ -150,7 +150,10 @@ struct SelectionRecord {
 pub fn prepare_server_identity(
     options: ServerPrepareOptions,
 ) -> std::result::Result<PreparedIdentity, PrepareIdentityError> {
-    tracing::info!(event = "identity_preparation_started");
+    tracing::info!(
+        event = "identity_preparation_started",
+        message = "Locking state, opening the AziHSM key, and selecting a verified certificate before Tokio starts."
+    );
     let state_lock = StateLock::acquire(&options.state_dir).map_err(classify)?;
     let created = !options.state_dir.join(REQUEST_METADATA).exists();
     if created {
@@ -212,7 +215,21 @@ pub fn prepare_server_identity(
     })?;
     publish_selection(&selected).map_err(classify)?;
     prune_generations(&options.state_dir, &candidates, &selected);
-    tracing::info!(event = "certificate_generation_selected");
+    let selection_message = match outcome {
+        CacheOutcome::Created => "Selected the newly enrolled certificate identity.",
+        CacheOutcome::Renewed => "Selected a newly renewed certificate identity.",
+        CacheOutcome::Current => {
+            "Selected the valid cached certificate because renewal is not yet required."
+        }
+        CacheOutcome::AvailabilityFallback => {
+            "Selected the still-valid cached certificate because the CA was unavailable."
+        }
+    };
+    tracing::info!(
+        event = "certificate_generation_selected",
+        cache_outcome = ?outcome,
+        message = selection_message
+    );
     Ok(PreparedIdentity {
         session,
         key_name: request.key_name,
@@ -293,6 +310,13 @@ pub fn validate_server_chain(
     })
 }
 
+pub(crate) fn log_renewal_started() {
+    tracing::info!(
+        event = "certificate_renewal_started",
+        message = "The certificate is missing, invalid, or within seven days of expiry, so startup is requesting a renewal."
+    );
+}
+
 fn renew(
     state_dir: &Path,
     request: &RequestMetadata,
@@ -300,7 +324,7 @@ fn renew(
     cached: Option<&Candidate>,
     now: OffsetDateTime,
 ) -> std::result::Result<(), CaFailure> {
-    tracing::info!(event = "certificate_renewal_started");
+    log_renewal_started();
     let client = CaClient::new(&request.ca_url);
     client.ready_typed()?;
     let metadata = client.metadata_typed()?;
@@ -384,7 +408,10 @@ fn renew(
     validate_server_chain(&reopened_root, &reopened_leaf, expected, now)
         .map_err(|source| protocol_failure(CaOperation::Enrollment, source))?;
     let _ = validity;
-    tracing::info!(event = "certificate_renewal_completed");
+    tracing::info!(
+        event = "certificate_renewal_completed",
+        message = "Renewal completed and the new certificate generation passed identity and validity checks."
+    );
     Ok(())
 }
 
@@ -432,13 +459,20 @@ fn load_candidates(
         match load_candidate(&directory, operation_id.clone(), expected, now) {
             Ok(candidate) => candidates.push(candidate),
             Err(_) => {
-                tracing::warn!(event = "certificate_generation_rejected");
+                tracing::warn!(
+                    event = "certificate_generation_rejected",
+                    message = "Rejected a cached certificate generation because it did not pass verification."
+                );
                 if directory != state_dir {
                     let quarantine = directory.with_file_name(format!("quarantine-{operation_id}"));
                     if !quarantine.exists()
                         && let Err(error) = fs::rename(&directory, quarantine)
                     {
-                        tracing::warn!(event = "generation_quarantine_failed", reason = %error);
+                        tracing::warn!(
+                            event = "generation_quarantine_failed",
+                            reason = %error,
+                            message = "A rejected cached generation could not be quarantined, but it was not selected."
+                        );
                     }
                 }
             }
@@ -557,7 +591,11 @@ fn prune_generations(state_dir: &Path, candidates: &[Candidate], selected: &Cand
             fs::remove_dir_all(&candidate.directory)
         };
         if let Err(error) = result {
-            tracing::warn!(event = "generation_prune_failed", reason = %error);
+            tracing::warn!(
+                event = "generation_prune_failed",
+                reason = %error,
+                message = "Old-generation cleanup failed without invalidating the selected certificate identity."
+            );
         }
     }
 }
@@ -608,7 +646,10 @@ fn select_or_renew(
             reload: true,
         }),
         Err(failure) if failure.kind == CaFailureKind::Availability && cached => {
-            tracing::warn!(event = "renewal_availability_fallback");
+            tracing::warn!(
+                event = "renewal_availability_fallback",
+                message = "The CA is unavailable, so startup is using the already verified and still-valid cached certificate."
+            );
             Ok(RenewalDecision {
                 outcome: CacheOutcome::AvailabilityFallback,
                 reload: false,

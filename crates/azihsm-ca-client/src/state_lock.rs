@@ -57,7 +57,10 @@ impl StateLock {
         if locked == 0 {
             return Err(state("state is locked by another process"));
         }
-        tracing::info!(event = "state_lock_acquired");
+        tracing::info!(
+            event = "state_lock_acquired",
+            message = "Holding the exclusive state lock so another demo or server process cannot mutate this identity."
+        );
         Ok(Self { file, path })
     }
 }
@@ -76,9 +79,15 @@ impl Drop for StateLock {
             )
         };
         if unlocked == 0 {
-            tracing::error!(event = "state_lock_release_failed");
+            tracing::error!(
+                event = "state_lock_release_failed",
+                message = "The operating system did not confirm release of the state lock."
+            );
         } else {
-            tracing::info!(event = "state_lock_released");
+            tracing::info!(
+                event = "state_lock_released",
+                message = "Released the exclusive state lock after key and state use completed."
+            );
         }
         let _ = &self.path;
     }

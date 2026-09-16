@@ -12,7 +12,11 @@ fn main() {
     azihsm_ca_demo::transcript::private_key_notice();
     let result = azihsm_ca_demo::execute(cli.command);
     if let Err(error) = result {
-        tracing::error!(event = "command_failed", class = ?error.class());
+        tracing::error!(
+            event = "command_failed",
+            class = ?error.class(),
+            message = "The demo command stopped safely; review the bounded error and unchanged public transcript."
+        );
         eprintln!("{error}");
         std::process::exit(error.exit_code().into());
     }

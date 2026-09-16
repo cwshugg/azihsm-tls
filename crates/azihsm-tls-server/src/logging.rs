@@ -76,7 +76,12 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(event = "command_started", command = "show");
+            tracing::info!(
+                event = "handshake_completed",
+                connection_id = 7_u64,
+                message = "The client accepted the server certificate and AziHSM signed CertificateVerify; no client identity was authenticated."
+            );
+            crate::identity::log_renewal_started();
             tracing::debug!(event = "must_be_filtered");
         });
         let output = String::from_utf8(
@@ -87,7 +92,16 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{error}"));
         assert!(output.contains("INFO"));
-        assert!(output.contains("event=\"command_started\""));
+        assert!(output.contains("event=\"handshake_completed\""));
+        assert!(output.contains("The client accepted the server certificate"));
+        assert!(output.contains("no client identity was authenticated"));
+        let renewal = output
+            .lines()
+            .find(|line| line.contains("event=\"certificate_renewal_started\""))
+            .unwrap_or_else(|| panic!("renewal start event was not captured"));
+        assert!(renewal.trim_start().starts_with("INFO "));
+        assert!(!renewal.contains("WARN"));
+        assert!(!output.contains(concat!("server authenticated", " the client")));
         assert!(!output.contains("must_be_filtered"));
         assert!(!output.contains('\u{1b}'));
         for sensitive in [

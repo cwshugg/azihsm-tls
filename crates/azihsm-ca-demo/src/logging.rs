@@ -76,7 +76,11 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(event = "command_started", command = "show");
+            tracing::info!(
+                event = "command_started",
+                command = "show",
+                message = "Showing public certificate metadata and the non-exportable AziHSM key reference."
+            );
             tracing::debug!(event = "must_be_filtered");
         });
         let output = String::from_utf8(
@@ -88,6 +92,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"));
         assert!(output.contains("INFO"));
         assert!(output.contains("event=\"command_started\""));
+        assert!(output.contains("Showing public certificate metadata"));
         assert!(!output.contains("must_be_filtered"));
         assert!(!output.contains('\u{1b}'));
         for sensitive in [

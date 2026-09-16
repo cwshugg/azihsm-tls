@@ -86,7 +86,11 @@ pub async fn run(
     }
     let expiry = Instant::now() + Duration::from_secs(remaining as u64);
     let listener = TcpListener::bind(listen).await?;
-    tracing::info!(event = "listener_started");
+    tracing::info!(
+        event = "listener_started",
+        listen = %listen,
+        message = "Listening for TLS clients; this bind address controls network reachability, while certificate SANs control server-name validation."
+    );
     let admission = Admission::new();
     let connection_runtime: Arc<dyn ConnectionRuntime> = Arc::new(TokioConnectionRuntime);
     let next_id = AtomicU64::new(1);
@@ -101,13 +105,20 @@ pub async fn run(
                 let permit = match admission.acquire() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        tracing::warn!(event = "connection_rejected");
+                        tracing::warn!(
+                            event = "connection_rejected",
+                            message = "Rejected the connection immediately because all 64 bounded connection permits are in use."
+                        );
                         drop(stream);
                         continue;
                     }
                 };
                 let id = next_id.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(event = "connection_admitted", connection_id = id);
+                tracing::info!(
+                    event = "connection_admitted",
+                    connection_id = id,
+                    message = "Admitted the connection under a bounded permit that is released when its task ends."
+                );
                 let acceptor = TlsAcceptor::from(Arc::clone(&config));
                 let receiver = shutdown_rx.clone();
                 let runtime = Arc::clone(&connection_runtime);
@@ -119,7 +130,8 @@ pub async fn run(
                         tracing::warn!(
                             event = "connection_failed",
                             connection_id = id,
-                            reason = %error
+                            reason = %error,
+                            message = "Closed the connection because its TLS, framing, timeout, or certificate-expiry checks failed."
                         );
                     }
                 });
@@ -127,12 +139,18 @@ pub async fn run(
             result = tokio::signal::ctrl_c() => {
                 result?;
                 expired = false;
-                tracing::info!(event = "shutdown_requested");
+                tracing::info!(
+                    event = "shutdown_requested",
+                    message = "Stopping admission and draining existing TLS connections before releasing the key and state lock."
+                );
                 break;
             }
             () = tokio::time::sleep_until(expiry) => {
                 expired = true;
-                tracing::warn!(event = "certificate_expired");
+                tracing::warn!(
+                    event = "certificate_expired",
+                    message = "The selected certificate expired, so the listener stopped and no further handshakes or responses are allowed."
+                );
                 break;
             }
         }
@@ -151,7 +169,11 @@ pub async fn run(
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    tracing::info!(event = "listener_stopped");
+    tracing::info!(
+        event = "listener_stopped",
+        message =
+            "The listener stopped after connection tasks drained or were boundedly cancelled."
+    );
     Ok(())
 }
 
@@ -168,7 +190,11 @@ pub async fn serve_connection(
     if runtime.now() >= expiry {
         return Err(io::Error::other("certificate expired before handshake"));
     }
-    tracing::info!(event = "handshake_started", connection_id = id);
+    tracing::info!(
+        event = "handshake_started",
+        connection_id = id,
+        message = "Starting a one-way TLS handshake in which the client validates this server; the server does not authenticate the client."
+    );
     let deadline = std::cmp::min(runtime.now() + runtime.handshake_timeout(), expiry);
     let mut tls = timeout_at(deadline, acceptor.accept(stream))
         .await
@@ -177,7 +203,11 @@ pub async fn serve_connection(
     if runtime.now() >= expiry {
         return Err(io::Error::other("certificate expired during handshake"));
     }
-    tracing::info!(event = "handshake_completed", connection_id = id);
+    tracing::info!(
+        event = "handshake_completed",
+        connection_id = id,
+        message = "The client accepted the server certificate and AziHSM signed CertificateVerify; no client identity was authenticated."
+    );
     let mut sequence = 0_u64;
     loop {
         let deadline = operation_deadline(
@@ -204,6 +234,13 @@ pub async fn serve_connection(
             ReadFrame::Payload(payload) => payload,
         };
         sequence += 1;
+        tracing::info!(
+            event = "frame_received",
+            connection_id = id,
+            frame_sequence = sequence,
+            request_bytes = request.len(),
+            message = "Received one four-byte-length-prefixed frame; its complete content follows as UTF-8 or base64."
+        );
         transcript(id, sequence, "received", &request);
         runtime.before_response().await;
         if runtime.now() >= expiry {
@@ -227,7 +264,8 @@ pub async fn serve_connection(
             connection_id = id,
             frame_sequence = sequence,
             request_bytes = request.len(),
-            response_bytes = response.len()
+            response_bytes = response.len(),
+            message = "Sent the fixed 19-byte prefix followed by the byte-identical request in one bounded length-prefixed response."
         );
     }
 }
@@ -258,8 +296,16 @@ async fn close_notify(
         expiry.saturating_duration_since(runtime.now()),
     );
     match timeout(duration, stream.shutdown()).await {
-        Ok(Ok(())) => tracing::info!(event = "close_notify_completed", connection_id = id),
-        _ => tracing::warn!(event = "close_notify_failed", connection_id = id),
+        Ok(Ok(())) => tracing::info!(
+            event = "close_notify_completed",
+            connection_id = id,
+            message = "Sent TLS close_notify and shut down the connection cleanly."
+        ),
+        _ => tracing::warn!(
+            event = "close_notify_failed",
+            connection_id = id,
+            message = "The bounded TLS close notification did not complete before its deadline."
+        ),
     }
 }
 

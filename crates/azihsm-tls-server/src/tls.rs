@@ -104,7 +104,10 @@ pub fn build_config(
     config.send_tls13_tickets = 0;
     config.max_early_data_size = 0;
     config.send_half_rtt_data = false;
-    tracing::info!(event = "rustls_configuration_completed");
+    tracing::info!(
+        event = "rustls_configuration_completed",
+        message = "Configured one-way TLS 1.3: the server sends the leaf certificate, clients trust the root independently, and AziHSM signs CertificateVerify."
+    );
     Ok(Arc::new(config))
 }
 
