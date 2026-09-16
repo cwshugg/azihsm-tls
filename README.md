@@ -22,10 +22,10 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 
 | **Task** | **Status** | **Description** |
 |----------|------------|-----------------|
-| Implement Mock CLA | Done | See [`azihsm-ca`](crates/azihsm-ca) |
+| Implement Mock CA | Done | See [`azihsm-ca`](crates/azihsm-ca) |
 | Initialize named TLS keys | Done | See [`keytool`](crates/keytool) |
 | Implement TLS Server | TODO | |
-| Test TLS-Server-to-Mock-CLA certificate issuing | TODO |
+| Test TLS-Server-to-Mock-CA certificate issuing | TODO |
 | Implement TLS Client | TODO | |
 | Test TLS-Client-to-TLS-Server communication | TODO | |
 | Test full workflow | TODO | |
