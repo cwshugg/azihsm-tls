@@ -60,8 +60,8 @@ $Output = 'C:\azihsm-demo\tls-server'
 
 & $DemoExe create `
     --output-dir $Output `
-    --subject-cn 'server.demo.internal' `
-    --dns 'server.demo.internal' `
+    --subject-cn 'server.demo' `
+    --dns 'server.demo' `
     --ip '192.0.2.20' `
     --ca-url 'http://192.0.2.10:8080' `
     --acknowledge-plain-http
@@ -245,8 +245,17 @@ Before publication, the client verifies:
 
 * `ca_not_ready`: inspect the CA state and poll `/readyz`; see the
   [CA server guide](ca-server-usage.md).
-* `san_not_authorized`: start the CA with every requested DNS/IP value in its
-  exact allowlist.
+* `san_not_authorized`: `--listen` controls only the CA's network binding; it
+  does not authorize certificate names. Restart or reconfigure the CA with one
+  exact `--allow-dns` or `--allow-ip` value for every requested SAN. Wildcards
+  are unsupported. The demo prints the required values; then reuse the same
+  AziHSM key, CSR, and idempotency key:
+
+  ```powershell
+  & $DemoExe retry `
+      --output-dir $Output `
+      --acknowledge-plain-http
+  ```
 * `unsupported_csr_profile`: preserve the output directory and inspect the
   printed CSR transcript; do not generate a replacement during an uncertain
   retry.

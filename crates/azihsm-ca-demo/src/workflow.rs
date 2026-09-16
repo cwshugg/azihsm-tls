@@ -546,7 +546,7 @@ fn enroll_and_publish(
     client.ready()?;
     let ca = client.metadata()?;
     let root = client.root()?;
-    let enrollment = client.enroll(csr_der, &metadata.idempotency_key)?;
+    let enrollment = client.enroll(csr_der, &metadata.idempotency_key, &metadata.dns_sans, &ips)?;
     verify::verify_chain(&root, &enrollment.leaf_der, spki, &metadata.dns_sans, &ips)?;
     publish_certificate_artifacts(output_dir, &root, &enrollment.leaf_der)?;
     let issuance = IssuanceMetadata {

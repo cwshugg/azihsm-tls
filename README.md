@@ -61,7 +61,7 @@ New-Item -ItemType Directory -Force C:\azihsm-demo | Out-Null
 
 .\crates\target\x86_64-pc-windows-msvc\release\azihsm-ca.exe serve `
     --state-dir C:\azihsm-demo\ca-state `
-    --allow-dns server.demo.internal
+    --allow-dns server.demo
 ```
 
 In a second PowerShell terminal:
@@ -69,8 +69,8 @@ In a second PowerShell terminal:
 ```powershell
 .\crates\target\x86_64-pc-windows-msvc\release\azihsm-ca-demo.exe create `
     --output-dir C:\azihsm-demo\tls-server `
-    --subject-cn server.demo.internal `
-    --dns server.demo.internal `
+    --subject-cn server.demo `
+    --dns server.demo `
     --ca-url http://127.0.0.1:8080 `
     --acknowledge-plain-http
 ```

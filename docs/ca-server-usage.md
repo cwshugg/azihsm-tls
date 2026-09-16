@@ -204,9 +204,11 @@ For a loopback-only check:
 & $CaExe serve `
     --state-dir $StateDir `
     --listen '127.0.0.1:8080' `
-    --allow-dns 'server.demo.internal' `
-    --allow-ip '192.0.2.20'
+    --allow-dns 'server.demo'
 ```
+
+`--listen '127.0.0.1:8080'` controls only network binding. It does not
+authorize `127.0.0.1` or any other certificate SAN.
 
 For a private demo network, bind a specific CA interface address rather than
 `0.0.0.0`:
@@ -215,7 +217,7 @@ For a private demo network, bind a specific CA interface address rather than
 & $CaExe serve `
     --state-dir $StateDir `
     --listen '192.0.2.10:8080' `
-    --allow-dns 'server.demo.internal' `
+    --allow-dns 'server.demo' `
     --allow-ip '192.0.2.20' `
     --leaf-validity-days 1 `
     --max-connections 16 `
@@ -237,7 +239,7 @@ $env:RUST_LOG = 'debug'
 & $CaExe serve `
     --state-dir $StateDir `
     --listen '127.0.0.1:8080' `
-    --allow-dns 'server.demo.internal'
+    --allow-dns 'server.demo'
 ```
 
 Module filters and comma-separated directives are rejected with exit code
@@ -359,7 +361,7 @@ $Csr = Join-Path $TlsDir 'server.csr.der'
 Signature="$Windows NT$"
 
 [NewRequest]
-Subject="CN=server.demo.internal"
+Subject="CN=server.demo"
 Exportable=FALSE
 MachineKeySet=FALSE
 ProviderName="Microsoft Software Key Storage Provider"
@@ -372,7 +374,7 @@ SMIME=FALSE
 
 [Extensions]
 2.5.29.17="{text}"
-_continue_="DNS=server.demo.internal"
+_continue_="DNS=server.demo"
 '@ | Set-Content -LiteralPath $Inf -Encoding Ascii
 
 certreq.exe -new -f -q -binary $Inf $Csr
@@ -582,7 +584,19 @@ completed issuances, cross-authority evidence, and inconsistent references.
 
 Ensure every CSR DNS/IP SAN exactly matches a repeated `--allow-dns` or
 `--allow-ip` value. DNS comparison is lowercase and exact; there are no
-wildcards, suffixes, CN fallback, or case folding.
+wildcards, suffixes, CN fallback, or case folding. `--listen` controls only
+network binding and does not authorize certificate names. After correcting
+the CA allowlist, preserve the existing AziHSM key, CSR, and idempotency key:
+
+```powershell
+$DemoExe = (Resolve-Path `
+    .\crates\target\x86_64-pc-windows-msvc\release\azihsm-ca-demo.exe).Path
+$OutputDir = 'C:\azihsm-demo\tls-server'
+
+& $DemoExe retry `
+    --output-dir $OutputDir `
+    --acknowledge-plain-http
+```
 
 ### CSR returns `400` or `422`
 
