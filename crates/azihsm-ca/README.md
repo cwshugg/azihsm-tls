@@ -2,10 +2,12 @@
 
 `azihsm-ca` is a persistent, Windows-only demonstration certificate authority.
 It stores one current-user named ECDSA P-256 CA key in the registered Microsoft
-Azure Integrated HSM Key Storage Provider and signs through Windows NCrypt and
-Crypt32. BCrypt supplies hashing, randomness, public-key verification, and
-known-answer tests. The product does not use OpenSSL, and OpenSSL is prohibited
-for product operation and validation.
+Azure Integrated HSM Key Storage Provider. Every CA signature uses that named
+key through NCrypt. Clap implements the CLI, Actix Web implements HTTP, rcgen
+constructs certificates through a custom NCrypt signing adapter, and
+x509-parser/ring provide parsing, hashing, randomness, identifiers, and public
+verification. There is no software CA signing fallback. The product does not
+use OpenSSL, and OpenSSL is prohibited for product operation and validation.
 
 ## Accepted demonstration risks
 
@@ -27,6 +29,8 @@ The implementation does not expand scope into API TLS, authentication, remote
 ledgers, client enrollment, or revocation.
 
 ## Build
+
+Rust 1.88 or newer is required by the selected Actix Web and rcgen versions.
 
 Run from the top-level `crates\` workspace:
 
@@ -70,7 +74,8 @@ version.
 ## Initialization and recovery
 
 Initialization acquires `authority.lock`, proves authority state and the named
-key are absent, and writes an append-only hash-chained journal before creating
+key are absent, atomically publishes `state-format.json`, and writes an
+append-only hash-chained journal before creating
 the staged key. NCrypt creation uses current-user scope, key spec `0`, and flags
 `0`; overwrite and machine-key flags are never used. Durable name arbitration
 occurs at finalization.
@@ -92,6 +97,12 @@ completed archived operations remain replay-discoverable. An undifferentiated
 operator must preserve the evidence and select a new key name and state
 directory.
 
+This version accepts only fresh state with format version `1` and producer
+`azihsm-ca-rcgen-actix-v1`. It does not migrate, adopt, or rewrite pre-refactor
+state. If an older named key persists, choose both a new collision-resistant
+key name and a new state directory. Do not overwrite or delete that key as
+part of rollout.
+
 `--reconcile-intent` requires documented successful-finalization evidence and
 reopens and validates that exact key. `--abandon-intent` requires absence of
 success or ambiguous-finalization evidence and proves exact key absence. It
@@ -103,6 +114,7 @@ The state directory contains:
 
 ```text
 authority.lock
+state-format.json
 authority.json
 root.der
 init-intents\active\
@@ -147,16 +159,14 @@ quarantine command preserves its bytes and reservation under
 
 ## Certificate requests and profiles
 
-Enrollment accepts only complete canonical DER PKCS#10 with:
+Enrollment accepts only complete DER PKCS#10 parsed by x509-parser, with:
 
 * version `0`;
 * parameterless ECDSA-SHA256 signature;
 * uncompressed P-256 subject public key;
-* valid proof of possession through BCrypt and Crypt32;
+* valid proof of possession through ring over the exact request-info bytes;
 * exactly one `extensionRequest`;
 * exactly one SAN extension containing one through sixteen DNS/IP entries;
-* the exact critical `digitalSignature` request emitted by the documented
-  `certreq` INF may also be present and is rebuilt rather than copied.
 
 The bounded CSR subject is parsed but ignored. Unsupported extensions, SAN
 types, duplicate SANs, wildcard names, Unicode DNS, and nonallowlisted SANs are
@@ -167,17 +177,21 @@ The root is `CN=AziHSM Demo Root`, `CA=true`, path length zero, and
 
 ## HTTP API
 
-The server supports one HTTP/1.1 request per connection and always closes it.
-It requires `Content-Length` framing and rejects duplicate headers, transfer
-encoding, chunking, trailers, upgrade, unsupported expectation, ambiguous
-targets, surplus bytes, and pipelining.
-Readiness starts false. The recursive watch is registered before the first
+Actix Web serves HTTP/1.1 with one worker, disabled keep-alive, a maximum of 64
+accepted connections, a backlog of 64, bounded request payloads, and
+`Connection: close`.
+Readiness starts false. A dedicated stoppable watcher thread registers the
+recursive watch before the first
 state-validating scan; notifications captured before or during that scan are
 drained using the same replacement/rescan loop before readiness can become
-true. One absolute ten-second deadline starts when a socket is accepted, remains
-attached while it waits in the bounded queue, and covers header reads, body
-reads, response writes, and flushes. Expired queued sockets are dropped and
-release their admission permits. A recursive `ReadDirectoryChangesW` watcher
+true. One accept-time absolute ten-second deadline bounds request-body collection,
+enrollment processing, blocking handoff, and response streaming. A small part
+of that same budget is reserved for transmitting timeout responses. Actix
+independently enforces its request-head and disconnect deadlines. Each accepted
+Windows socket also has an independently owned duplicate used only to cancel
+pending I/O and shut down the transport at the same absolute deadline, so a
+non-reading peer cannot retain a server connection slot indefinitely. A
+recursive `ReadDirectoryChangesW` watcher
 makes state-dependent routes unavailable while changes are validated under the
 issuance mutex. Watcher failure or overflow installs a replacement watch before
 scanning. Notifications captured during the scan are consumed; changes or
@@ -201,9 +215,20 @@ replay returns `200` with byte-identical DER; a changed request under the same
 key returns `409`. Metadata links are fixed relative paths and never reflect
 `Host`.
 
-Status reports only the currently loaded record and stored expiry. It is not a
-revocation or general-validity assertion. Unknown, malformed, incomplete, and
-quarantined identifiers use the same `404` shape.
+JSON responses retain schema version `1`. Liveness is
+`{"schema_version":1,"live":true}`, readiness uses `ready`, and metadata
+contains `authority_id`, `root`, and `certificates`. Errors use the nested
+`{"schema_version":1,"error":{"code":"...","message":"..."}}` shape. Status
+returns the stored serialized status object directly, not a JSON string.
+Unknown `GET` and `POST` targets use the certificate-not-found `404` shape;
+every other method uses the versioned `method_not_allowed` `405` shape,
+including unknown targets.
+
+Leaf validity is capped at the persisted root certificate's `notAfter`.
+Enrollment fails closed when the root has expired or no positive validity
+interval remains. Status reports only the currently loaded record and stored
+expiry. It is not a revocation or general-validity assertion. Unknown,
+malformed, incomplete, and quarantined identifiers use the same `404` shape.
 
 ## Windows PowerShell 5.1 enrollment
 

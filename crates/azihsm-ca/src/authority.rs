@@ -1,7 +1,8 @@
 //! Authority initialization, recovery, validation, issuance, and quarantine.
 
-use crate::cert::der::certificate_slices;
+use crate::cert::{CertificateBacking, certificate_not_after};
 use crate::cli::{InitArgs, InitMode, ServeArgs};
+use crate::crypto::{hash_sha256, random};
 use crate::csr::ParsedCsr;
 use crate::error::{Error, ErrorClass, Result};
 use crate::state::{
@@ -9,13 +10,11 @@ use crate::state::{
     InitPublication, IssuanceCommit, IssuanceIntent, IssuanceRecord, RootSigningIntent,
     SCHEMA_VERSION, SerialReservation, StateLock, append_audit, create_protected_dir,
     durable_bytes, durable_json, finalize_pending_publication, hex, numbered_json_entries,
-    parse_utc, pending_entries, read_bounded, read_json, read_pending_publication, utc_now,
-    validate_state_dir,
+    parse_utc, pending_entries, publish_state_format, read_bounded, read_json,
+    read_pending_publication, utc_now, validate_state_dir, validate_state_format,
 };
-use crate::win::bcrypt::{hash_sha256, random};
 use crate::win::crypt32::{
-    CertContext, CertificateBacking, spki_der_from_blob, verify_certificate_signature,
-    verify_exclusive_chain,
+    CertContext, spki_der_from_blob, verify_certificate_signature, verify_exclusive_chain,
 };
 use crate::win::ncrypt::{AziKey, AziProvider, E_UNEXPECTED_STATUS};
 use std::fs;
@@ -42,15 +41,25 @@ pub struct Issued {
 }
 
 pub fn initialize(args: InitArgs) -> Result<()> {
-    let _lock = StateLock::acquire(&args.state_dir, true)?;
     match args.mode {
         InitMode::Fresh {
             provider,
             key_name,
             root_valid_days,
-        } => fresh_init(&args.state_dir, provider, key_name, root_valid_days),
-        InitMode::Reconcile { operation_id } => reconcile(&args.state_dir, &operation_id),
-        InitMode::Abandon { operation_id } => abandon(&args.state_dir, &operation_id),
+        } => {
+            let _lock = StateLock::acquire(&args.state_dir, true)?;
+            fresh_init(&args.state_dir, provider, key_name, root_valid_days)
+        }
+        InitMode::Reconcile { operation_id } => {
+            validate_state_format(&args.state_dir)?;
+            let _lock = StateLock::acquire(&args.state_dir, false)?;
+            reconcile(&args.state_dir, &operation_id)
+        }
+        InitMode::Abandon { operation_id } => {
+            validate_state_format(&args.state_dir)?;
+            let _lock = StateLock::acquire(&args.state_dir, false)?;
+            abandon(&args.state_dir, &operation_id)
+        }
     }
 }
 
@@ -77,6 +86,7 @@ fn fresh_init(
         ));
     }
     assert_empty_product_namespaces(state_dir)?;
+    publish_state_format(state_dir)?;
     let provider = AziProvider::open_named(&provider_name)?;
     provider.require_absent(&key_name)?;
     let operation_id = hex(&random::<16>()?);
@@ -289,7 +299,7 @@ fn create_root_signing_intent(
         .map_err(|_| Error::new(ErrorClass::Validation, "root time precedes Unix epoch"))?;
     let root = CertificateBacking::root(public_blob, serial, reference_time, root_valid_days)?;
     let tbs_der = root.to_be_signed_der()?;
-    let spki = spki_der_from_blob(public_blob);
+    let spki = spki_der_from_blob(public_blob)?;
     Ok(RootSigningIntent {
         schema_version: SCHEMA_VERSION,
         operation_id: operation_id.to_owned(),
@@ -322,7 +332,7 @@ fn root_backing_from_intent(
         || intent.root_valid_days != generation.root_valid_days
         || intent.public_blob_hex != hex(public_blob)
         || intent.public_key_sha256 != hex(&hash_sha256(public_blob)?)
-        || intent.spki_sha256 != hex(&hash_sha256(&spki_der_from_blob(public_blob))?)
+        || intent.spki_sha256 != hex(&hash_sha256(&spki_der_from_blob(public_blob)?)?)
     {
         return Err(Error::new(
             ErrorClass::Validation,
@@ -375,14 +385,14 @@ fn ensure_journal_root(
         validate_journal_root(&root_der, intent, key, public_blob)?;
         return Ok(root_der);
     }
-    if let Some(pending) = read_pending_publication(&root_path, ROOT_CAP)? {
-        if !pending.is_empty() {
-            validate_journal_root(&pending, intent, key, public_blob)?;
-            finalize_pending_publication(&root_path)?;
-            return Ok(pending);
-        }
+    if let Some(pending) = read_pending_publication(&root_path, ROOT_CAP)?
+        && !pending.is_empty()
+    {
+        validate_journal_root(&pending, intent, key, public_blob)?;
+        finalize_pending_publication(&root_path)?;
+        return Ok(pending);
     }
-    let root_der = backing.sign(key.key.0)?;
+    let root_der = backing.sign(key)?;
     validate_journal_root(&root_der, intent, key, public_blob)?;
     durable_bytes(&root_path, &root_der)?;
     Ok(root_der)
@@ -394,9 +404,8 @@ fn validate_journal_root(
     key: &AziKey,
     public_blob: &[u8; 72],
 ) -> Result<()> {
-    let slices = certificate_slices(root_der)?;
-    if hex(slices.tbs) != intent.tbs_der_hex || hex(&hash_sha256(slices.tbs)?) != intent.tbs_sha256
-    {
+    let tbs = crate::cert::certificate_tbs(root_der)?;
+    if hex(&tbs) != intent.tbs_der_hex || hex(&hash_sha256(&tbs)?) != intent.tbs_sha256 {
         return Err(Error::new(
             ErrorClass::Validation,
             "journal root does not match the persisted TBS transaction",
@@ -419,6 +428,7 @@ fn create_init_publication(
             intent.reference_time_subsec_nanos,
         ))
         .ok_or_else(|| Error::new(ErrorClass::Validation, "root reference time overflow"))?;
+    let root_context = CertContext::create(root_der)?;
     let authority = Authority {
         schema_version: SCHEMA_VERSION,
         authority_id: intent.authority_id.clone(),
@@ -432,6 +442,8 @@ fn create_init_publication(
         root_sha256: hex(&hash_sha256(root_der)?),
         root_serial: intent.serial.clone(),
         root_subject: "CN=AziHSM Demo Root".to_owned(),
+        root_subject_der_hex: hex(root_context.subject()?),
+        root_ski_hex: hex(&root_context.subject_key_identifier()?),
         not_before: time_from_system(
             reference_time
                 .checked_sub(Duration::from_secs(300))
@@ -486,7 +498,8 @@ fn validate_init_publication(
         || publication.authority.key_name != generation.key_name
         || publication.authority.root_sha256 != publication.root_sha256
         || publication.authority.public_key_sha256 != hex(&hash_sha256(public_blob)?)
-        || publication.authority.spki_sha256 != hex(&hash_sha256(&spki_der_from_blob(public_blob))?)
+        || publication.authority.spki_sha256
+            != hex(&hash_sha256(&spki_der_from_blob(public_blob)?)?)
     {
         return Err(Error::new(
             ErrorClass::Validation,
@@ -560,7 +573,7 @@ fn publish_exact_or_validate(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn decode_hex_vec(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0
+    if !value.len().is_multiple_of(2)
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -650,6 +663,7 @@ pub fn load(state_dir: &Path) -> Result<LoadedAuthority> {
 }
 
 pub fn load_for_serve(state_dir: &Path) -> Result<LoadedAuthority> {
+    validate_state_format(state_dir)?;
     let authority: Authority = read_json(&state_dir.join("authority.json"), AUTHORITY_CAP)?;
     validate_authority_fields(&authority)?;
     let root_der = read_bounded(&state_dir.join("root.der"), ROOT_CAP)?;
@@ -670,7 +684,7 @@ pub fn load_for_serve(state_dir: &Path) -> Result<LoadedAuthority> {
     key.kat()?;
     let public_blob = key.public_blob()?;
     if hex(&hash_sha256(&public_blob)?) != authority.public_key_sha256
-        || hex(&hash_sha256(&spki_der_from_blob(&public_blob))?) != authority.spki_sha256
+        || hex(&hash_sha256(&spki_der_from_blob(&public_blob)?)?) != authority.spki_sha256
     {
         return Err(Error::new(
             ErrorClass::Validation,
@@ -678,8 +692,34 @@ pub fn load_for_serve(state_dir: &Path) -> Result<LoadedAuthority> {
         ));
     }
     let root_context = CertContext::create(&root_der)?;
+    if hex(root_context.subject()?) != authority.root_subject_der_hex
+        || hex(&root_context.subject_key_identifier()?) != authority.root_ski_hex
+    {
+        return Err(Error::new(
+            ErrorClass::Validation,
+            "persisted root subject or SKI does not match root.der",
+        ));
+    }
     root_context.validate_p256_public_blob(&public_blob)?;
     verify_certificate_signature(&root_der, &root_context)?;
+    let generations = validate_journal(state_dir, &authority.init_operation_id)?;
+    let first = generations
+        .first()
+        .ok_or_else(|| Error::new(ErrorClass::Validation, "initialization journal is empty"))?;
+    let journal = journal_directory(state_dir, &authority.init_operation_id)?;
+    let root_intent: RootSigningIntent = read_json(&journal.join("root-signing.json"), 256 * 1024)?;
+    let reconstructed = root_backing_from_intent(
+        &root_intent,
+        &authority.init_operation_id,
+        first,
+        &public_blob,
+    )?;
+    if reconstructed.to_be_signed_der()? != crate::cert::certificate_tbs(&root_der)? {
+        return Err(Error::new(
+            ErrorClass::Validation,
+            "reconstructed root TBSCertificate does not match root.der",
+        ));
+    }
     Ok(LoadedAuthority {
         state_dir: state_dir.to_path_buf(),
         authority,
@@ -690,6 +730,7 @@ pub fn load_for_serve(state_dir: &Path) -> Result<LoadedAuthority> {
 
 pub fn revalidate(loaded: &LoadedAuthority) -> Result<()> {
     validate_state_dir(&loaded.state_dir)?;
+    validate_state_format(&loaded.state_dir)?;
     let authority: Authority = read_json(&loaded.state_dir.join("authority.json"), AUTHORITY_CAP)?;
     if authority != loaded.authority {
         return Err(Error::new(
@@ -717,6 +758,7 @@ pub fn revalidate(loaded: &LoadedAuthority) -> Result<()> {
 }
 
 pub fn inspect(state_dir: &Path) -> Result<String> {
+    validate_state_format(state_dir)?;
     let _lock = StateLock::acquire(state_dir, false)?;
     let loaded = load(state_dir)?;
     let completed = completed_issuance_ids(state_dir)?.len();
@@ -797,14 +839,15 @@ pub fn issue(
     let issuance_dir = loaded.state_dir.join("issuances").join(&issuance_id);
     create_protected_dir(&issuance_dir)?;
     let now = SystemTime::now();
-    let not_before_system = now
-        .checked_sub(Duration::from_secs(300))
-        .ok_or_else(|| Error::new(ErrorClass::Validation, "leaf time underflow"))?;
-    let not_after_system = now
-        .checked_add(Duration::from_secs(
-            u64::from(policy.leaf_valid_hours) * 3600,
-        ))
-        .ok_or_else(|| Error::new(ErrorClass::Validation, "leaf time overflow"))?;
+    let persisted_root_expiry = certificate_not_after(&loaded.root_der)?;
+    if persisted_root_expiry != parse_utc(&loaded.authority.not_after)? {
+        return Err(Error::new(
+            ErrorClass::Validation,
+            "persisted root notAfter does not match authority state",
+        ));
+    }
+    let (not_before_system, not_after_system) =
+        leaf_validity_interval(now, policy.leaf_valid_hours, persisted_root_expiry)?;
     let root_context = CertContext::create(&loaded.root_der)?;
     let root_ski = root_context.subject_key_identifier()?;
     let backing = CertificateBacking::leaf(
@@ -812,8 +855,8 @@ pub fn issue(
         &parsed.public_blob,
         serial,
         &root_ski,
-        now,
-        policy.leaf_valid_hours,
+        not_before_system,
+        not_after_system,
         &parsed.dns_sans,
         &parsed.ip_sans,
     )?;
@@ -848,7 +891,7 @@ pub fn issue(
             created_at: created_at.clone(),
         },
     )?;
-    let certificate = backing.sign(loaded.key.key.0)?;
+    let certificate = backing.sign(&loaded.key)?;
     let leaf_context = CertContext::create(&certificate)?;
     leaf_context.validate_p256_public_blob(&parsed.public_blob)?;
     verify_certificate_signature(&certificate, &root_context)?;
@@ -906,6 +949,7 @@ pub fn issue(
 }
 
 pub fn quarantine(state_dir: &Path, issuance_id: &str) -> Result<()> {
+    validate_state_format(state_dir)?;
     let _lock = StateLock::acquire(state_dir, false)?;
     let loaded = load(state_dir).or_else(|error| {
         if error.exit_code() == ErrorClass::StateBusy as u8 {
@@ -1676,6 +1720,13 @@ fn validate_authority_fields(authority: &Authority) -> Result<()> {
         || authority.algorithm != "ECDSA_P256"
         || authority.signature_oid != "1.2.840.10045.4.3.2"
         || authority.root_subject != "CN=AziHSM Demo Root"
+        || authority.root_subject_der_hex.is_empty()
+        || !authority.root_subject_der_hex.len().is_multiple_of(2)
+        || authority.root_ski_hex.len() != 40
+        || !authority
+            .root_ski_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         || authority.profile != "azihsm-demo-root-v1"
     {
         return Err(Error::new(
@@ -1767,16 +1818,15 @@ fn validate_journal(state_dir: &Path, operation_id: &str) -> Result<Vec<InitGene
                 "journal identity, sequence, or hash chain mismatch",
             ));
         }
-        if let Some(first) = generations.first() {
-            if generation.provider != first.provider
+        if let Some(first) = generations.first()
+            && (generation.provider != first.provider
                 || generation.key_name != first.key_name
-                || generation.root_valid_days != first.root_valid_days
-            {
-                return Err(Error::new(
-                    ErrorClass::State,
-                    "journal immutable parameters changed",
-                ));
-            }
+                || generation.root_valid_days != first.root_valid_days)
+        {
+            return Err(Error::new(
+                ErrorClass::State,
+                "journal immutable parameters changed",
+            ));
         }
         prior = Some(hex(&hash_sha256(&bytes)?));
         generations.push(generation);
@@ -1915,6 +1965,7 @@ fn assert_empty_product_namespaces(state_dir: &Path) -> Result<()> {
         "abandoned-issuances",
         "serial-reservations",
         "idempotency",
+        "audit",
     ] {
         if numbered_json_entries(&state_dir.join(name))?.is_empty() {
             continue;
@@ -1923,6 +1974,16 @@ fn assert_empty_product_namespaces(state_dir: &Path) -> Result<()> {
             ErrorClass::Precondition,
             format!("`{name}` must be empty"),
         ));
+    }
+    for archive in ["completed", "abandoned"] {
+        if !numbered_json_entries(&state_dir.join("init-intents").join("archive").join(archive))?
+            .is_empty()
+        {
+            return Err(Error::new(
+                ErrorClass::Precondition,
+                "initialization archive must be empty for fresh state",
+            ));
+        }
     }
     Ok(())
 }
@@ -2018,6 +2079,31 @@ fn time_from_system(value: SystemTime) -> Result<String> {
         })
 }
 
+fn leaf_validity_interval(
+    now: SystemTime,
+    requested_hours: u16,
+    root_expiry: time::OffsetDateTime,
+) -> Result<(SystemTime, SystemTime)> {
+    let not_before = now
+        .checked_sub(Duration::from_secs(300))
+        .ok_or_else(|| Error::new(ErrorClass::Validation, "leaf time underflow"))?;
+    let requested_not_after = now
+        .checked_add(Duration::from_secs(u64::from(requested_hours) * 3_600))
+        .ok_or_else(|| Error::new(ErrorClass::Validation, "leaf time overflow"))?;
+    let root_seconds = u64::try_from(root_expiry.unix_timestamp())
+        .map_err(|_| Error::new(ErrorClass::Validation, "root notAfter precedes Unix epoch"))?;
+    let root_not_after = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(root_seconds))
+        .ok_or_else(|| Error::new(ErrorClass::Validation, "root notAfter overflow"))?;
+    if root_not_after <= now {
+        return Err(Error::new(
+            ErrorClass::Precondition,
+            "root certificate has no remaining leaf validity interval",
+        ));
+    }
+    Ok((not_before, requested_not_after.min(root_not_after)))
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -2044,6 +2130,8 @@ mod tests {
             root_sha256: "root".to_owned(),
             root_serial: "01".to_owned(),
             root_subject: "CN=AziHSM Demo Root".to_owned(),
+            root_subject_der_hex: "subject".to_owned(),
+            root_ski_hex: "ski".to_owned(),
             not_before: "2026-01-01T00:00:00Z".to_owned(),
             not_after: "2027-01-01T00:00:00Z".to_owned(),
             profile: "azihsm-demo-root-v1".to_owned(),
@@ -2196,11 +2284,11 @@ mod tests {
 
     #[test]
     fn root_signing_intent_reconstructs_identical_tbs() {
-        let public_blob = [
-            0x45, 0x43, 0x53, 0x31, 0x20, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let mut public_blob = [0_u8; 72];
+        public_blob[..4].copy_from_slice(&0x3153_4345_u32.to_le_bytes());
+        public_blob[4..8].copy_from_slice(&32_u32.to_le_bytes());
+        public_blob[8] = 1;
+        public_blob[40] = 2;
         let intent = create_root_signing_intent("operation", "provider", "key", 30, &public_blob)
             .unwrap_or_else(|error| panic!("{error}"));
         let generation = InitGeneration {
@@ -2226,6 +2314,23 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(first, second);
         assert_eq!(hex(&first), intent.tbs_der_hex);
+    }
+
+    #[test]
+    fn leaf_validity_is_capped_by_root_expiry() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let root_expiry = time::OffsetDateTime::from(now + Duration::from_secs(600));
+        let (not_before, not_after) =
+            leaf_validity_interval(now, 24, root_expiry).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(not_before, now - Duration::from_secs(300));
+        assert_eq!(not_after, now + Duration::from_secs(600));
+    }
+
+    #[test]
+    fn leaf_validity_rejects_expired_root() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let root_expiry = time::OffsetDateTime::from(now - Duration::from_secs(1));
+        assert!(leaf_validity_interval(now, 24, root_expiry).is_err());
     }
 
     #[test]

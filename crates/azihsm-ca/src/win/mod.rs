@@ -1,6 +1,5 @@
 //! Safe ownership wrappers and Windows cryptography operations.
 
-pub mod bcrypt;
 pub mod crypt32;
 pub mod handles;
 pub mod ncrypt;

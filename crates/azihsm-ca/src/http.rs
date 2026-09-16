@@ -1,4 +1,4 @@
-//! Bounded HTTP/1.1 parsing, routing, rate limiting, admission, and shutdown.
+//! Bounded Actix Web HTTP service and dedicated readiness watcher.
 
 use crate::authority::{LoadedAuthority, certificate_bytes, certificate_status, issue};
 use crate::cli::ServeArgs;
@@ -6,1083 +6,1239 @@ use crate::csr::parse_and_authorize;
 use crate::error::{Error, ErrorClass, Result};
 use crate::policy::warning_text;
 use crate::state::{DirectoryWatcher, WatchResult};
-use serde_json::json;
-use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use actix_web::body::{BoxBody, MessageBody};
+use actix_web::dev::{ServiceRequest, ServiceResponse};
+use actix_web::http::{KeepAlive, StatusCode, header};
+use actix_web::middleware::Next;
+use actix_web::{App, FromRequest, HttpMessage, HttpRequest, HttpResponse, HttpServer, web};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::future::Future;
+use std::mem::ManuallyDrop;
+use std::net::{IpAddr, Shutdown, TcpStream};
+use std::os::windows::io::{AsRawSocket, FromRawSocket};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 
-const MAX_REQUEST_LINE: usize = 2048;
-const MAX_HEADERS_BYTES: usize = 16_384;
-const MAX_HEADERS: usize = 32;
-const MAX_HEADER_NAME: usize = 64;
-const MAX_HEADER_VALUE: usize = 4096;
-const MAX_RESPONSE: usize = 131_072;
+const REQUEST_LIMIT: usize = 16_384;
 const REQUEST_LIFETIME: Duration = Duration::from_secs(10);
+
+struct AcceptedConnection {
+    accepted: Instant,
+    _abort: Arc<ConnectionAbort>,
+}
+
+struct ConnectionAbort {
+    socket: TcpStream,
+}
+
+#[derive(Clone, Copy)]
+struct RequestDeadline {
+    processing: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct DeadlineConfig(Duration);
+
+struct Pkcs10Request(web::Bytes);
+
+impl FromRequest for Pkcs10Request {
+    type Error = actix_web::Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self, Self::Error>>>>;
+
+    fn from_request(request: &HttpRequest, payload: &mut actix_web::dev::Payload) -> Self::Future {
+        let payload = web::Payload::from_request(request, payload);
+        let deadline = request
+            .extensions()
+            .get::<RequestDeadline>()
+            .copied()
+            .map_or_else(
+                || tokio::time::Instant::now() + REQUEST_LIFETIME,
+                |value| tokio::time::Instant::from_std(value.processing),
+            );
+        Box::pin(async move {
+            let payload = payload.await?;
+            match tokio::time::timeout_at(deadline, payload.to_bytes_limited(REQUEST_LIMIT)).await {
+                Err(_) => Err(actix_web::error::InternalError::from_response(
+                    "busy",
+                    json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+                )
+                .into()),
+                Ok(Ok(Ok(bytes))) => Ok(Self(bytes)),
+                Ok(Err(_)) => Err(actix_web::error::InternalError::from_response(
+                    "request_too_large",
+                    json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+                )
+                .into()),
+                Ok(Ok(Err(_))) => Err(actix_web::error::InternalError::from_response(
+                    "malformed_request",
+                    json_error(StatusCode::BAD_REQUEST, "malformed_request"),
+                )
+                .into()),
+            }
+        })
+    }
+}
+
+struct AppState {
+    authority: Arc<LoadedAuthority>,
+    policy: ServeArgs,
+    issuance: Arc<Mutex<()>>,
+    ready: Arc<AtomicBool>,
+    readiness_pending: Arc<AtomicBool>,
+    admission: Arc<Semaphore>,
+    blocking: Arc<Semaphore>,
+    in_flight: Arc<AtomicUsize>,
+    limiter: Mutex<RateLimiter>,
+}
+
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    schema_version: u32,
+    error: ErrorDetail<'a>,
+}
+
+#[derive(Serialize)]
+struct ErrorDetail<'a> {
+    code: &'a str,
+    message: &'a str,
+}
 
 pub fn serve(args: ServeArgs, loaded: LoadedAuthority) -> Result<()> {
     eprint!("{}", warning_text());
-    if !args.listen.ip().is_loopback() {
-        eprintln!(
-            "WARNING: non-loopback binding and firewall rules reduce reachability only; they do not authenticate callers."
-        );
-    }
-    let listener = TcpListener::bind(args.listen)
-        .map_err(|error| Error::new(ErrorClass::Http, format!("HTTP bind failed: {error}")))?;
-    listener.set_nonblocking(true).map_err(|error| {
-        Error::new(
-            ErrorClass::Http,
-            format!("nonblocking setup failed: {error}"),
-        )
-    })?;
-    let shutdown = Arc::new(AtomicBool::new(false));
-    install_console_handler(Arc::clone(&shutdown))?;
-    let permits = Arc::new(PermitPool::new(args.max_connections as usize));
-    let workers = usize::from(args.max_connections.min(8));
-    let queue_capacity = args.max_connections as usize - workers;
-    let queue = Arc::new(SocketQueue::new(queue_capacity));
     let authority = Arc::new(loaded);
-    let policy = Arc::new(args.clone());
-    let limiter = Arc::new(Mutex::new(RateLimiter::new(
-        args.per_source_per_minute,
-        args.global_per_minute,
-    )));
-    let issuance_mutex = Arc::new(Mutex::new(()));
-    let readiness = Arc::new(AtomicBool::new(false));
-    let mut watcher = DirectoryWatcher::register(&authority.state_dir)?;
-    let initially_consistent = issuance_mutex.lock().ok().is_some_and(|_guard| {
-        scan_until_quiescent(
-            &mut watcher,
-            &shutdown,
-            || crate::authority::revalidate(&authority).is_ok(),
-            || DirectoryWatcher::register_replacement(&authority.state_dir),
-        )
+    let issuance = Arc::new(Mutex::new(()));
+    let ready = Arc::new(AtomicBool::new(false));
+    let pending = Arc::new(AtomicBool::new(true));
+    let watcher = ReadinessWatcher::start(
+        Arc::clone(&authority),
+        Arc::clone(&issuance),
+        Arc::clone(&ready),
+        Arc::clone(&pending),
+    )?;
+    let state = web::Data::new(AppState {
+        authority,
+        policy: args.clone(),
+        issuance,
+        ready,
+        readiness_pending: pending,
+        admission: Arc::new(Semaphore::new(32)),
+        blocking: Arc::new(Semaphore::new(4)),
+        in_flight: Arc::new(AtomicUsize::new(0)),
+        limiter: Mutex::new(RateLimiter::new()),
     });
-    if !initially_consistent {
-        return Err(Error::new(
-            ErrorClass::State,
-            "initial watched state scan did not reach a consistent quiescent point",
-        ));
-    }
-    readiness.store(true, Ordering::Release);
-    let watcher_handle = {
-        let authority = Arc::clone(&authority);
-        let issuance_mutex = Arc::clone(&issuance_mutex);
-        let readiness = Arc::clone(&readiness);
-        let shutdown = Arc::clone(&shutdown);
-        thread::spawn(move || {
-            readiness_watch_loop(watcher, &authority, &issuance_mutex, &readiness, &shutdown);
+    let listen = args.listen;
+    let max_connections = usize::from(args.max_connections.min(64));
+    let result = actix_web::rt::System::new().block_on(async move {
+        HttpServer::new(move || {
+            App::new()
+                .app_data(state.clone())
+                .app_data(web::PayloadConfig::new(REQUEST_LIMIT))
+                .app_data(web::Data::new(DeadlineConfig(REQUEST_LIFETIME)))
+                .wrap(actix_web::middleware::from_fn(protocol_middleware))
+                .service(api_scope())
         })
-    };
-    let mut worker_handles = Vec::new();
-    for _ in 0..workers {
-        let queue = Arc::clone(&queue);
-        let authority = Arc::clone(&authority);
-        let policy = Arc::clone(&policy);
-        let limiter = Arc::clone(&limiter);
-        let issuance_mutex = Arc::clone(&issuance_mutex);
-        let shutdown = Arc::clone(&shutdown);
-        let readiness = Arc::clone(&readiness);
-        worker_handles.push(thread::spawn(move || {
-            while let Some(socket) = queue.pop(&shutdown) {
-                let _ = handle_connection(
-                    socket,
-                    &authority,
-                    &policy,
-                    &limiter,
-                    &issuance_mutex,
-                    &readiness,
-                );
-            }
-        }));
-    }
-    while !shutdown.load(Ordering::Acquire) {
-        let Some(permit) = permits.try_acquire() else {
-            thread::park_timeout(Duration::from_millis(25));
-            continue;
-        };
-        match listener.accept() {
-            Ok((stream, source)) => {
-                let socket = AdmittedSocket {
-                    stream,
-                    source: source.ip(),
-                    deadline: Instant::now() + REQUEST_LIFETIME,
-                    _permit: permit,
-                };
-                if !queue.push(socket, &shutdown) {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                drop(permit);
-                thread::park_timeout(Duration::from_millis(25));
-            }
-            Err(error) => {
-                shutdown.store(true, Ordering::Release);
-                queue.close();
-                return Err(Error::new(
-                    ErrorClass::Http,
-                    format!("HTTP accept failed: {error}"),
-                ));
-            }
-        }
-    }
-    shutdown.store(true, Ordering::Release);
-    queue.close();
-    for handle in worker_handles {
-        handle
-            .join()
-            .map_err(|_| Error::new(ErrorClass::Http, "HTTP worker panicked"))?;
-    }
-    watcher_handle
-        .join()
-        .map_err(|_| Error::new(ErrorClass::Http, "readiness watcher panicked"))?;
-    Ok(())
+        .workers(1)
+        .worker_max_blocking_threads(4)
+        .max_connections(max_connections)
+        .backlog(64)
+        .client_request_timeout(REQUEST_LIFETIME)
+        .client_disconnect_timeout(Duration::from_secs(2))
+        .keep_alive(KeepAlive::Disabled)
+        .shutdown_timeout(10)
+        .on_connect(|io, extensions| {
+            register_connection_deadline(io, extensions, REQUEST_LIFETIME);
+        })
+        .bind(listen)
+        .map_err(|error| Error::new(ErrorClass::Http, format!("HTTP bind failed: {error}")))?
+        .run()
+        .await
+        .map_err(|error| Error::new(ErrorClass::Http, format!("HTTP server failed: {error}")))
+    });
+    watcher.stop_and_join()?;
+    result
 }
 
-fn readiness_watch_loop(
-    mut watcher: DirectoryWatcher,
-    authority: &LoadedAuthority,
-    issuance_mutex: &Mutex<()>,
-    readiness: &AtomicBool,
-    shutdown: &AtomicBool,
+fn api_scope() -> actix_web::Scope {
+    web::scope("")
+        .service(
+            web::resource("/livez")
+                .route(web::get().to(livez))
+                .default_service(web::to(method_not_allowed)),
+        )
+        .service(
+            web::resource("/readyz")
+                .route(web::get().to(readyz))
+                .default_service(web::to(method_not_allowed)),
+        )
+        .service(
+            web::resource("/v1/ca")
+                .route(web::get().to(metadata))
+                .default_service(web::to(method_not_allowed)),
+        )
+        .service(
+            web::resource("/v1/ca/root")
+                .route(web::get().to(root))
+                .default_service(web::to(method_not_allowed)),
+        )
+        .service(
+            web::resource("/v1/certificates")
+                .route(web::post().to(enroll))
+                .default_service(web::to(method_not_allowed)),
+        )
+        .service(
+            web::resource("/v1/certificates/{id}")
+                .route(web::get().to(certificate))
+                .default_service(web::to(method_not_allowed)),
+        )
+        .service(
+            web::resource("/v1/certificates/{id}/status")
+                .route(web::get().to(status))
+                .default_service(web::to(method_not_allowed)),
+        )
+        .default_service(web::to(fallback))
+}
+
+fn register_connection_deadline(
+    io: &dyn std::any::Any,
+    extensions: &mut actix_web::dev::Extensions,
+    lifetime: Duration,
 ) {
-    let mut last_kat = Instant::now();
-    while !shutdown.load(Ordering::Acquire) {
-        let result = watcher.wait(Duration::from_millis(250));
-        let recurring = last_kat.elapsed() >= Duration::from_secs(60);
-        if !recurring && matches!(result, Ok(WatchResult::Timeout)) {
-            continue;
-        }
-        readiness.store(false, Ordering::Release);
-        if result.is_err() || matches!(result, Ok(WatchResult::Overflow)) {
-            match DirectoryWatcher::register_replacement(&authority.state_dir) {
-                Ok(replacement) => watcher = replacement,
-                Err(_) => {
-                    last_kat = Instant::now();
-                    continue;
-                }
-            }
-        }
-        let consistent = issuance_mutex.lock().ok().is_some_and(|_guard| {
-            scan_until_quiescent(
-                &mut watcher,
-                shutdown,
-                || crate::authority::revalidate(authority).is_ok(),
-                || DirectoryWatcher::register_replacement(&authority.state_dir),
-            )
-        });
-        if consistent && !shutdown.load(Ordering::Acquire) {
-            readiness.store(true, Ordering::Release);
-        }
-        last_kat = Instant::now();
-    }
-}
-
-trait ChangeWatch {
-    fn poll(&mut self, timeout: Duration) -> Result<WatchResult>;
-}
-
-impl ChangeWatch for DirectoryWatcher {
-    fn poll(&mut self, timeout: Duration) -> Result<WatchResult> {
-        self.wait(timeout)
-    }
-}
-
-fn scan_until_quiescent<W, S, R>(
-    watcher: &mut W,
-    shutdown: &AtomicBool,
-    mut scan: S,
-    mut register: R,
-) -> bool
-where
-    W: ChangeWatch,
-    S: FnMut() -> bool,
-    R: FnMut() -> Result<W>,
-{
-    loop {
-        if shutdown.load(Ordering::Acquire) || !scan() {
-            return false;
-        }
-        match watcher.poll(Duration::ZERO) {
-            Ok(WatchResult::Timeout) => return true,
-            Ok(WatchResult::Changed) => {}
-            Ok(WatchResult::Overflow) | Err(_) => match register() {
-                Ok(replacement) => *watcher = replacement,
-                Err(_) => return false,
-            },
-        }
-    }
-}
-
-fn handle_connection(
-    mut socket: AdmittedSocket,
-    authority: &LoadedAuthority,
-    policy: &ServeArgs,
-    limiter: &Mutex<RateLimiter>,
-    issuance_mutex: &Mutex<()>,
-    readiness: &AtomicBool,
-) -> Result<()> {
-    let deadline = socket.deadline;
-    if Instant::now() >= deadline {
-        return Err(Error::new(
-            ErrorClass::Http,
-            "accepted request expired before worker service",
-        ));
-    }
-    let request = match read_request(&mut socket.stream, policy.max_request_body_bytes, deadline) {
-        Ok(request) => request,
-        Err(response) => return write_response(&mut socket.stream, response, deadline),
+    let Some(stream) = io.downcast_ref::<actix_web::rt::net::TcpStream>() else {
+        return;
     };
-    let response = route(
-        request,
-        socket.source,
-        authority,
-        policy,
-        limiter,
-        issuance_mutex,
-        readiness,
-    );
-    write_response(&mut socket.stream, response, deadline)
-}
-
-#[derive(Debug)]
-struct Request {
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct Response {
-    status: u16,
-    content_type: &'static str,
-    body: Vec<u8>,
-    extra_headers: Vec<(&'static str, String)>,
-}
-
-fn read_request(
-    stream: &mut TcpStream,
-    body_limit: usize,
-    deadline: Instant,
-) -> std::result::Result<Request, Response> {
-    let mut bytes = Vec::with_capacity(4096);
-    let header_end;
-    loop {
-        if Instant::now() >= deadline {
-            return Err(error_response(400, "malformed_request", "request rejected"));
-        }
-        let mut chunk = [0; 1024];
-        set_read_remaining(stream, deadline)?;
-        let count = stream
-            .read(&mut chunk)
-            .map_err(|_| error_response(400, "malformed_request", "request rejected"))?;
-        if count == 0 {
-            return Err(error_response(400, "malformed_request", "request rejected"));
-        }
-        bytes.extend_from_slice(&chunk[..count]);
-        if bytes.len() > MAX_HEADERS_BYTES + body_limit {
-            return Err(error_response(413, "request_too_large", "request rejected"));
-        }
-        if let Some(position) = find(&bytes, b"\r\n\r\n") {
-            header_end = position + 4;
-            reject_raw_framing(&bytes[..header_end])?;
-            break;
-        }
-        reject_raw_framing(&bytes)?;
-        if bytes.len() > MAX_HEADERS_BYTES {
-            return Err(error_response(413, "request_too_large", "request rejected"));
-        }
-    }
-    let header_bytes = &bytes[..header_end];
-    let request_line_end = find(header_bytes, b"\r\n")
-        .ok_or_else(|| error_response(400, "malformed_request", "request rejected"))?;
-    if request_line_end > MAX_REQUEST_LINE {
-        return Err(error_response(413, "request_too_large", "request rejected"));
-    }
-    let mut parsed_headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let mut parsed = httparse::Request::new(&mut parsed_headers);
-    match parsed.parse(header_bytes) {
-        Ok(httparse::Status::Complete(consumed)) if consumed == header_end => {}
-        _ => return Err(error_response(400, "malformed_request", "request rejected")),
-    }
-    if parsed.version != Some(1) {
-        return Err(error_response(400, "malformed_request", "request rejected"));
-    }
-    let method = parsed
-        .method
-        .ok_or_else(|| error_response(400, "malformed_request", "request rejected"))?
-        .to_owned();
-    let path = parsed
-        .path
-        .ok_or_else(|| error_response(400, "malformed_request", "request rejected"))?
-        .to_owned();
-    validate_target(&path)?;
-    let mut headers = HashMap::new();
-    for header in parsed.headers.iter() {
-        if header.name.len() > MAX_HEADER_NAME || header.value.len() > MAX_HEADER_VALUE {
-            return Err(error_response(413, "request_too_large", "request rejected"));
-        }
-        let name = header.name.to_ascii_lowercase();
-        let value = std::str::from_utf8(header.value)
-            .map_err(|_| error_response(400, "malformed_request", "request rejected"))?
-            .trim()
-            .to_owned();
-        if headers.insert(name.clone(), value).is_some() {
-            return Err(error_response(400, "malformed_request", "request rejected"));
-        }
-        if matches!(
-            name.as_str(),
-            "transfer-encoding" | "trailer" | "upgrade" | "expect" | "content-encoding"
-        ) {
-            return Err(error_response(400, "malformed_request", "request rejected"));
-        }
-    }
-    if !headers.contains_key("host") {
-        return Err(error_response(400, "malformed_request", "request rejected"));
-    }
-    let length = match headers.get("content-length") {
-        Some(value) => {
-            if value.is_empty()
-                || value.len() > 1 && value.starts_with('0')
-                || !value.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err(error_response(400, "malformed_request", "request rejected"));
-            }
-            value
-                .parse::<usize>()
-                .map_err(|_| error_response(400, "malformed_request", "request rejected"))?
-        }
-        None => 0,
+    let raw = stream.as_raw_socket();
+    // SAFETY: `borrowed` is never dropped; `try_clone` creates the independently owned socket.
+    let borrowed = ManuallyDrop::new(unsafe { TcpStream::from_raw_socket(raw) });
+    let Ok(socket) = borrowed.try_clone() else {
+        return;
     };
-    if length > body_limit {
-        return Err(error_response(413, "request_too_large", "request rejected"));
-    }
-    while bytes.len() < header_end + length {
-        let remaining = header_end + length - bytes.len();
-        let mut chunk = vec![0; remaining.min(1024)];
-        set_read_remaining(stream, deadline)?;
-        let count = stream
-            .read(&mut chunk)
-            .map_err(|_| error_response(400, "malformed_request", "request rejected"))?;
-        if count == 0 {
-            return Err(error_response(400, "malformed_request", "request rejected"));
+    let abort = Arc::new(ConnectionAbort { socket });
+    let deadline_abort = Arc::clone(&abort);
+    actix_web::rt::spawn(async move {
+        tokio::time::sleep(lifetime).await;
+        // SAFETY: the duplicated socket remains owned by `deadline_abort` for this call.
+        unsafe {
+            CancelIoEx(
+                deadline_abort.socket.as_raw_socket() as HANDLE,
+                std::ptr::null(),
+            );
         }
-        bytes.extend_from_slice(&chunk[..count]);
-    }
-    if bytes.len() != header_end + length {
-        return Err(error_response(400, "malformed_request", "request rejected"));
-    }
-    Ok(Request {
-        method,
-        path,
-        headers,
-        body: bytes[header_end..].to_vec(),
-    })
+        let _ = deadline_abort.socket.shutdown(Shutdown::Both);
+    });
+    extensions.insert(AcceptedConnection {
+        accepted: Instant::now(),
+        _abort: abort,
+    });
 }
 
-fn reject_raw_framing(bytes: &[u8]) -> std::result::Result<(), Response> {
-    if bytes.contains(&0) {
-        return Err(error_response(400, "malformed_request", "request rejected"));
-    }
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
-            return Err(error_response(400, "malformed_request", "request rejected"));
-        }
-        if *byte == b'\r' && bytes.get(index + 1).is_some_and(|next| *next != b'\n') {
-            return Err(error_response(400, "malformed_request", "request rejected"));
-        }
-    }
-    if bytes
-        .windows(3)
-        .any(|window| window[0..2] == *b"\r\n" && matches!(window[2], b' ' | b'\t'))
-    {
-        return Err(error_response(400, "malformed_request", "request rejected"));
-    }
-    Ok(())
+async fn livez() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"schema_version":1,"live":true}))
 }
 
-fn validate_target(path: &str) -> std::result::Result<(), Response> {
-    if !path.starts_with('/')
-        || path.starts_with("//")
-        || path.contains("://")
-        || path.contains('#')
-        || path.contains('?')
-        || path.contains('%')
-        || path.contains('\\')
-        || path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
-    {
-        return Err(error_response(400, "malformed_request", "request rejected"));
-    }
-    Ok(())
-}
-
-fn route(
-    request: Request,
-    source: IpAddr,
-    authority: &LoadedAuthority,
-    policy: &ServeArgs,
-    limiter: &Mutex<RateLimiter>,
-    issuance_mutex: &Mutex<()>,
-    readiness: &AtomicBool,
-) -> Response {
-    if request.path != "/livez" && request.path != "/readyz" && !readiness.load(Ordering::Acquire) {
-        return error_response(503, "ca_not_ready", "request rejected");
-    }
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/livez") => json_response(200, json!({"schema_version":1,"live":true})),
-        ("GET", "/readyz") => {
-            if readiness.load(Ordering::Acquire) {
-                json_response(200, json!({"schema_version":1,"ready":true}))
-            } else {
-                error_response(503, "ca_not_ready", "request rejected")
-            }
-        }
-        ("GET", "/v1/ca") => json_response(
-            200,
-            json!({
-                "schema_version":1,
-                "authority_id": authority.authority.authority_id,
-                "root":"/v1/ca/root",
-                "certificates":"/v1/certificates"
-            }),
-        ),
-        ("GET", "/v1/ca/root") => Response {
-            status: 200,
-            content_type: "application/pkix-cert",
-            body: authority.root_der.clone(),
-            extra_headers: Vec::new(),
-        },
-        ("POST", "/v1/certificates") => {
-            enroll(request, source, authority, policy, limiter, issuance_mutex)
-        }
-        ("GET", path) if path.ends_with("/status") => {
-            let id = path
-                .strip_prefix("/v1/certificates/")
-                .and_then(|value| value.strip_suffix("/status"));
-            match id.and_then(|id| certificate_status(&authority.state_dir, id).ok().flatten()) {
-                Some(body) => Response {
-                    status: 200,
-                    content_type: "application/json",
-                    body: body.into_bytes(),
-                    extra_headers: Vec::new(),
-                },
-                None => not_found(),
-            }
-        }
-        ("GET", path) if path.starts_with("/v1/certificates/") => {
-            let id = &path["/v1/certificates/".len()..];
-            match certificate_bytes(&authority.state_dir, id).ok().flatten() {
-                Some(body) => Response {
-                    status: 200,
-                    content_type: "application/pkix-cert",
-                    body,
-                    extra_headers: Vec::new(),
-                },
-                None => not_found(),
-            }
-        }
-        ("GET", _) | ("POST", _) => not_found(),
-        _ => error_response(405, "method_not_allowed", "request rejected"),
-    }
-}
-
-fn enroll(
-    request: Request,
-    source: IpAddr,
-    authority: &LoadedAuthority,
-    policy: &ServeArgs,
-    limiter: &Mutex<RateLimiter>,
-    issuance_mutex: &Mutex<()>,
-) -> Response {
-    if request.headers.get("content-type").map(String::as_str) != Some("application/pkcs10") {
-        return error_response(415, "unsupported_media_type", "request rejected");
-    }
-    let Some(idempotency) = request.headers.get("idempotency-key") else {
-        return error_response(400, "invalid_idempotency_key", "request rejected");
-    };
-    if idempotency.len() != 32
-        || !idempotency
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return error_response(400, "invalid_idempotency_key", "request rejected");
-    }
-    if !limiter
-        .lock()
-        .map(|mut value| value.allow(source))
-        .unwrap_or(false)
-    {
-        return error_response(429, "rate_limited", "request rejected");
-    }
-    let parsed = match parse_and_authorize(&request.body, policy) {
-        Ok(parsed) => parsed,
-        Err(error) => return map_enrollment_error(&error),
-    };
-    let _guard = match issuance_mutex.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response(503, "ca_not_ready", "request rejected"),
-    };
-    match issue(
-        authority,
-        policy,
-        &parsed,
-        &request.body,
-        idempotency,
-        &source.to_string(),
-    ) {
-        Ok(issued) => Response {
-            status: issued.status,
-            content_type: "application/pkix-cert",
-            body: issued.certificate,
-            extra_headers: vec![("X-AziHSM-Issuance-Id", issued.issuance_id)],
-        },
-        Err(error) => map_enrollment_error(&error),
-    }
-}
-
-fn map_enrollment_error(error: &Error) -> Response {
-    let text = error.to_string();
-    if text.contains("idempotency_conflict") {
-        error_response(409, "idempotency_conflict", "request rejected")
-    } else if text.contains("san_not_authorized") {
-        error_response(403, "san_not_authorized", "request rejected")
-    } else if text.contains("san_required") {
-        error_response(422, "san_required", "request rejected")
-    } else if text.contains("unsupported_csr_profile") {
-        error_response(422, "unsupported_csr_profile", "request rejected")
-    } else if text.contains("malformed_subject") {
-        error_response(400, "malformed_subject", "request rejected")
-    } else if text.contains("malformed_csr") {
-        error_response(400, "malformed_csr", "request rejected")
+async fn protocol_middleware(
+    request: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> std::result::Result<ServiceResponse<BoxBody>, actix_web::Error> {
+    let accepted = request
+        .request()
+        .conn_data::<AcceptedConnection>()
+        .map_or_else(Instant::now, |value| value.accepted);
+    let lifetime = request
+        .app_data::<web::Data<DeadlineConfig>>()
+        .map_or(REQUEST_LIFETIME, |config| config.0);
+    let deadline = accepted + lifetime;
+    let response_reserve = Duration::from_millis(250).min(lifetime / 4);
+    let processing_deadline = deadline.checked_sub(response_reserve).unwrap_or(deadline);
+    request.extensions_mut().insert(RequestDeadline {
+        processing: processing_deadline,
+    });
+    let malformed = request.version() != actix_web::http::Version::HTTP_11
+        || request.headers().get_all(header::HOST).count() != 1
+        || request.headers().contains_key(header::TRANSFER_ENCODING)
+        || request.headers().contains_key(header::EXPECT)
+        || request.headers().contains_key(header::UPGRADE)
+        || request.headers().contains_key(header::TRAILER);
+    let response = if Instant::now() >= deadline {
+        request
+            .into_response(json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"))
+            .map_into_boxed_body()
+    } else if malformed {
+        request
+            .into_response(json_error(StatusCode::BAD_REQUEST, "malformed_request"))
+            .map_into_boxed_body()
     } else {
-        error_response(503, "ca_not_ready", "request rejected")
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(processing_deadline),
+            next.call(request),
+        )
+        .await
+        {
+            Ok(response) => response?.map_into_boxed_body(),
+            Err(_) => {
+                return Err(actix_web::error::InternalError::from_response(
+                    "busy",
+                    json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+                )
+                .into());
+            }
+        }
+    };
+    let mut response = response
+        .map_body(|_, body| DeadlineBody {
+            body: Box::pin(body),
+            deadline,
+        })
+        .map_into_boxed_body();
+    response.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("close"),
+    );
+    Ok(response)
+}
+
+async fn readyz(state: web::Data<AppState>) -> HttpResponse {
+    readiness_response(is_ready(&state))
+}
+
+fn readiness_response(ready: bool) -> HttpResponse {
+    if ready {
+        HttpResponse::Ok().json(serde_json::json!({"schema_version":1,"ready":true}))
+    } else {
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready")
     }
 }
 
-fn json_response(status: u16, value: serde_json::Value) -> Response {
-    Response {
-        status,
-        content_type: "application/json",
-        body: serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec()),
-        extra_headers: Vec::new(),
+async fn metadata(state: web::Data<AppState>) -> HttpResponse {
+    if !is_ready(&state) {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+    }
+    metadata_response(&state.authority.authority.authority_id)
+}
+
+fn metadata_response(authority_id: &str) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "schema_version": 1,
+        "authority_id": authority_id,
+        "root": "/v1/ca/root",
+        "certificates": "/v1/certificates"
+    }))
+}
+
+async fn root(state: web::Data<AppState>) -> HttpResponse {
+    if !is_ready(&state) {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+    }
+    HttpResponse::Ok()
+        .content_type("application/pkix-cert")
+        .body(state.authority.root_der.clone())
+}
+
+async fn enroll(
+    request: HttpRequest,
+    body: Pkcs10Request,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    let deadline = request.extensions().get::<RequestDeadline>().map_or_else(
+        || Instant::now() + REQUEST_LIFETIME,
+        |value| value.processing,
+    );
+    if Instant::now() >= deadline {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy");
+    }
+    if !is_ready(&state) {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+    }
+    if request.version() != actix_web::http::Version::HTTP_11
+        || request.headers().contains_key(header::TRANSFER_ENCODING)
+        || request.headers().contains_key(header::EXPECT)
+    {
+        return json_error(StatusCode::BAD_REQUEST, "malformed_request");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        != Some("application/pkcs10")
+    {
+        return json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type");
+    }
+    let idempotency = match request
+        .headers()
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if valid_hex32(value) => value.to_owned(),
+        _ => return json_error(StatusCode::BAD_REQUEST, "invalid_idempotency_key"),
+    };
+    let body = body.0;
+    let source = match request.peer_addr().map(|address| address.ip()) {
+        Some(source) => source,
+        None => return json_error(StatusCode::BAD_REQUEST, "malformed_request"),
+    };
+    if !state
+        .limiter
+        .lock()
+        .ok()
+        .is_some_and(|mut limiter| limiter.allow(source))
+    {
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let admission = match Arc::clone(&state.admission).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+    };
+    let blocking = match Arc::clone(&state.blocking).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+    };
+    let parsed = match parse_and_authorize(&body, &state.policy) {
+        Ok(parsed) => parsed,
+        Err(error) => return mapped_error(&error),
+    };
+    if Instant::now() >= deadline {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy");
+    }
+    let authority = Arc::clone(&state.authority);
+    let policy = state.policy.clone();
+    let issuance = Arc::clone(&state.issuance);
+    let in_flight = Arc::clone(&state.in_flight);
+    let source = source.to_string();
+    let body = body.to_vec();
+    let job = actix_web::rt::task::spawn_blocking(move || {
+        let _guard = InFlightGuard::new(in_flight);
+        let _permits: (OwnedSemaphorePermit, OwnedSemaphorePermit) = (admission, blocking);
+        let _lock = issuance
+            .lock()
+            .map_err(|_| Error::new(ErrorClass::State, "issuance mutex poisoned"))?;
+        issue(&authority, &policy, &parsed, &body, &idempotency, &source)
+    });
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), job).await {
+        Ok(Ok(Ok(issued))) => HttpResponse::build(
+            StatusCode::from_u16(issued.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .insert_header(("X-AziHSM-Issuance-Id", issued.issuance_id))
+        .content_type("application/pkix-cert")
+        .body(issued.certificate),
+        Ok(Ok(Err(error))) => mapped_error(&error),
+        _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
     }
 }
 
-fn error_response(status: u16, code: &str, message: &str) -> Response {
-    json_response(
-        status,
-        json!({"schema_version":1,"error":{"code":code,"message":message}}),
+async fn certificate(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
+    if !is_ready(&state) {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+    }
+    match certificate_bytes(&state.authority.state_dir, &path) {
+        Ok(Some(bytes)) => HttpResponse::Ok()
+            .content_type("application/pkix-cert")
+            .body(bytes),
+        _ => not_found(),
+    }
+}
+
+async fn status(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
+    if !is_ready(&state) {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+    }
+    match certificate_status(&state.authority.state_dir, &path) {
+        Ok(Some(status)) => status_response(status),
+        _ => not_found(),
+    }
+}
+
+fn status_response(status: String) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(status)
+}
+
+async fn fallback(request: HttpRequest) -> HttpResponse {
+    if matches!(
+        *request.method(),
+        actix_web::http::Method::GET | actix_web::http::Method::POST
+    ) {
+        not_found()
+    } else {
+        method_not_allowed().await
+    }
+}
+
+async fn method_not_allowed() -> HttpResponse {
+    json_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
+}
+
+fn not_found() -> HttpResponse {
+    json_error_with_message(
+        StatusCode::NOT_FOUND,
+        "certificate_not_found",
+        "certificate not found",
     )
 }
 
-fn not_found() -> Response {
-    error_response(404, "certificate_not_found", "certificate not found")
+fn is_ready(state: &AppState) -> bool {
+    state.ready.load(Ordering::Acquire) && !state.readiness_pending.load(Ordering::Acquire)
 }
 
-fn write_response(stream: &mut TcpStream, response: Response, deadline: Instant) -> Result<()> {
-    if response.body.len() > MAX_RESPONSE {
-        return Err(Error::new(
-            ErrorClass::Http,
-            "response exceeds configured cap",
-        ));
+fn json_error(status: StatusCode, code: &'static str) -> HttpResponse {
+    json_error_with_message(status, code, "request rejected")
+}
+
+fn json_error_with_message(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> HttpResponse {
+    HttpResponse::build(status).json(ErrorBody {
+        schema_version: 1,
+        error: ErrorDetail { code, message },
+    })
+}
+
+fn mapped_error(error: &Error) -> HttpResponse {
+    let text = error.to_string();
+    if text.contains("san_not_allowed") {
+        json_error(StatusCode::FORBIDDEN, "san_not_authorized")
+    } else if text.contains("idempotency_conflict") {
+        json_error(StatusCode::CONFLICT, "idempotency_conflict")
+    } else if text.contains("san_required") {
+        json_error(StatusCode::UNPROCESSABLE_ENTITY, "san_required")
+    } else if text.contains("unsupported_csr_profile") {
+        json_error(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_csr_profile")
+    } else if text.contains("malformed_subject") {
+        json_error(StatusCode::BAD_REQUEST, "malformed_subject")
+    } else if text.contains("malformed_csr") {
+        json_error(StatusCode::BAD_REQUEST, "malformed_csr")
+    } else {
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready")
     }
-    let reason = match response.status {
-        200 => "OK",
-        201 => "Created",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        413 => "Content Too Large",
-        415 => "Unsupported Media Type",
-        422 => "Unprocessable Content",
-        429 => "Too Many Requests",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
-        response.status,
-        reason,
-        response.content_type,
-        response.body.len()
-    );
-    for (name, value) in response.extra_headers {
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(&value);
-        head.push_str("\r\n");
-    }
-    head.push_str("\r\n");
-    write_all_remaining(stream, head.as_bytes(), deadline)?;
-    write_all_remaining(stream, &response.body, deadline)?;
-    set_write_remaining(stream, deadline)?;
-    stream
-        .flush()
-        .map_err(|error| Error::new(ErrorClass::Http, format!("HTTP flush failed: {error}")))
 }
 
-fn set_read_remaining(stream: &TcpStream, deadline: Instant) -> std::result::Result<(), Response> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| error_response(400, "malformed_request", "request rejected"))?;
-    stream
-        .set_read_timeout(Some(remaining.min(Duration::from_secs(5))))
-        .map_err(|_| error_response(400, "malformed_request", "request rejected"))
+fn valid_hex32(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn set_write_remaining(stream: &TcpStream, deadline: Instant) -> Result<()> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| {
-            Error::new(
-                ErrorClass::Http,
-                "absolute request deadline expired before response completed",
-            )
-        })?;
-    stream
-        .set_write_timeout(Some(remaining.min(Duration::from_secs(5))))
-        .map_err(|error| Error::new(ErrorClass::Http, format!("write timeout failed: {error}")))
-}
+struct InFlightGuard(Arc<AtomicUsize>);
 
-fn write_all_remaining(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
-    while !bytes.is_empty() {
-        set_write_remaining(stream, deadline)?;
-        let written = stream
-            .write(bytes)
-            .map_err(|error| Error::new(ErrorClass::Http, format!("HTTP write failed: {error}")))?;
-        if written == 0 {
-            return Err(Error::new(ErrorClass::Http, "HTTP write made no progress"));
-        }
-        bytes = &bytes[written..];
-    }
-    Ok(())
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-struct AdmittedSocket {
-    stream: TcpStream,
-    source: IpAddr,
+struct DeadlineBody<B> {
+    body: Pin<Box<B>>,
     deadline: Instant,
-    _permit: Permit,
 }
 
-struct PermitPool {
-    available: AtomicUsize,
-}
+impl<B> MessageBody for DeadlineBody<B>
+where
+    B: MessageBody,
+    B::Error: Into<Box<dyn std::error::Error>>,
+{
+    type Error = Box<dyn std::error::Error>;
 
-impl PermitPool {
-    fn new(count: usize) -> Self {
-        Self {
-            available: AtomicUsize::new(count),
+    fn size(&self) -> actix_web::body::BodySize {
+        self.body.as_ref().size()
+    }
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<web::Bytes, Self::Error>>> {
+        if Instant::now() >= self.deadline {
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "absolute request deadline expired during response transmission",
+            )))));
+        }
+        match self.body.as_mut().poll_next(context) {
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
+}
 
-    fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
-        self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_sub(1)
-            })
-            .ok()
-            .map(|_| Permit(Arc::clone(self)))
+impl InFlightGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
     }
 }
 
-struct Permit(Arc<PermitPool>);
-
-impl Drop for Permit {
+impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.0.available.fetch_add(1, Ordering::Release);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-struct SocketQueue {
-    state: Mutex<QueueState>,
-    available: Condvar,
-    capacity: usize,
+struct ReadinessWatcher {
+    stop_event: HANDLE,
+    thread: thread::JoinHandle<()>,
 }
 
-struct QueueState {
-    sockets: VecDeque<AdmittedSocket>,
-    closed: bool,
-}
-
-impl SocketQueue {
-    fn new(capacity: usize) -> Self {
-        Self {
-            state: Mutex::new(QueueState {
-                sockets: VecDeque::new(),
-                closed: false,
-            }),
-            available: Condvar::new(),
-            capacity: capacity.max(1),
+impl ReadinessWatcher {
+    fn start(
+        authority: Arc<LoadedAuthority>,
+        issuance: Arc<Mutex<()>>,
+        ready: Arc<AtomicBool>,
+        pending: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let mut watcher = DirectoryWatcher::register(&authority.state_dir)?;
+        let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if stop_event.is_null() {
+            return Err(Error::new(
+                ErrorClass::Http,
+                "watcher stop event creation failed",
+            ));
         }
-    }
-
-    fn push(&self, socket: AdmittedSocket, shutdown: &AtomicBool) -> bool {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return false,
-        };
-        while state.sockets.len() >= self.capacity
-            && !state.closed
-            && !shutdown.load(Ordering::Acquire)
-        {
-            state = match self
-                .available
-                .wait_timeout(state, Duration::from_millis(25))
-            {
-                Ok((state, _)) => state,
-                Err(_) => return false,
-            };
-        }
-        if state.closed || shutdown.load(Ordering::Acquire) {
-            return false;
-        }
-        state.sockets.push_back(socket);
-        self.available.notify_one();
-        true
-    }
-
-    fn pop(&self, shutdown: &AtomicBool) -> Option<AdmittedSocket> {
-        let mut state = self.state.lock().ok()?;
-        loop {
-            if let Some(socket) = state.sockets.pop_front() {
-                self.available.notify_one();
-                return Some(socket);
+        let stop_value = stop_event as usize;
+        let handle = thread::spawn(move || {
+            let stop_event = stop_value as HANDLE;
+            let mut initial = true;
+            loop {
+                let event = if initial {
+                    initial = false;
+                    Ok(Some(WatchResult::Timeout))
+                } else {
+                    match watcher.wait_with_stop(stop_event, Duration::from_secs(60)) {
+                        Ok(None) => break,
+                        other => other,
+                    }
+                };
+                pending.store(true, Ordering::Release);
+                ready.store(false, Ordering::Release);
+                if event.is_err() || matches!(event, Ok(Some(WatchResult::Overflow))) {
+                    match DirectoryWatcher::register_replacement(&authority.state_dir) {
+                        Ok(replacement) => watcher = replacement,
+                        Err(_) => continue,
+                    }
+                }
+                if let Ok(_guard) = issuance.lock() {
+                    loop {
+                        if crate::authority::revalidate(&authority).is_err() {
+                            break;
+                        }
+                        match watcher.wait(Duration::ZERO) {
+                            Ok(WatchResult::Timeout) => {
+                                pending.store(false, Ordering::Release);
+                                ready.store(true, Ordering::Release);
+                                break;
+                            }
+                            Ok(_) | Err(_) => {
+                                match DirectoryWatcher::register_replacement(&authority.state_dir) {
+                                    Ok(replacement) => watcher = replacement,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            if state.closed || shutdown.load(Ordering::Acquire) {
-                return None;
-            }
-            state = self.available.wait(state).ok()?;
-        }
+        });
+        Ok(Self {
+            stop_event,
+            thread: handle,
+        })
     }
 
-    fn close(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.closed = true;
-            state.sockets.clear();
-            self.available.notify_all();
+    fn stop_and_join(self) -> Result<()> {
+        if unsafe { SetEvent(self.stop_event) } == 0 {
+            return Err(Error::new(ErrorClass::Http, "watcher stop signal failed"));
         }
+        let result = self
+            .thread
+            .join()
+            .map_err(|_| Error::new(ErrorClass::Http, "readiness watcher panicked"));
+        unsafe { CloseHandle(self.stop_event) };
+        result
     }
-}
-
-#[derive(Debug)]
-struct Bucket {
-    tokens: f64,
-    updated: Instant,
 }
 
 struct RateLimiter {
-    sources: HashMap<IpAddr, Bucket>,
-    source_refill: f64,
-    global_refill: f64,
-    global: Bucket,
+    sources: HashMap<IpAddr, (u8, Instant)>,
+    global: (u8, Instant),
 }
 
 impl RateLimiter {
-    fn new(source_per_minute: u16, global_per_minute: u16) -> Self {
+    fn new() -> Self {
         Self {
             sources: HashMap::new(),
-            source_refill: f64::from(source_per_minute) / 60.0,
-            global_refill: f64::from(global_per_minute) / 60.0,
-            global: Bucket {
-                tokens: 10.0,
-                updated: Instant::now(),
-            },
+            global: (10, Instant::now()),
         }
     }
 
     fn allow(&mut self, source: IpAddr) -> bool {
-        let now = Instant::now();
-        refill(&mut self.global, self.global_refill, 10.0, now);
-        if self.global.tokens < 1.0 {
+        self.allow_at(source, Instant::now())
+    }
+
+    fn allow_at(&mut self, source: IpAddr, now: Instant) -> bool {
+        refill(&mut self.global, now, Duration::from_secs(1), 10);
+        let entry = self.sources.entry(source).or_insert((3, now));
+        refill(entry, now, Duration::from_secs(6), 3);
+        if self.global.0 == 0 || entry.0 == 0 {
             return false;
         }
-        if self.sources.len() >= 1024 && !self.sources.contains_key(&source) {
-            if let Some(oldest) = self
-                .sources
-                .iter()
-                .min_by_key(|(_, bucket)| bucket.updated)
-                .map(|(address, _)| *address)
-            {
-                self.sources.remove(&oldest);
-            }
+        self.global.0 -= 1;
+        entry.0 -= 1;
+        if self.sources.len() > 1024 {
+            self.sources
+                .retain(|_, value| now.duration_since(value.1) < Duration::from_secs(60));
         }
-        let bucket = self.sources.entry(source).or_insert(Bucket {
-            tokens: 3.0,
-            updated: now,
-        });
-        refill(bucket, self.source_refill, 3.0, now);
-        if bucket.tokens < 1.0 {
-            return false;
-        }
-        bucket.tokens -= 1.0;
-        self.global.tokens -= 1.0;
         true
     }
 }
 
-fn refill(bucket: &mut Bucket, refill_per_second: f64, burst: f64, now: Instant) {
-    let elapsed = now.duration_since(bucket.updated).as_secs_f64();
-    bucket.tokens = (bucket.tokens + elapsed * refill_per_second).min(burst);
-    bucket.updated = now;
-}
-
-fn install_console_handler(shutdown: Arc<AtomicBool>) -> Result<()> {
-    static SHUTDOWN: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
-    unsafe extern "system" fn handler(_: u32) -> i32 {
-        if let Ok(guard) = SHUTDOWN.lock()
-            && let Some(flag) = guard.as_ref()
-        {
-            flag.store(true, Ordering::Release);
-            return 1;
-        }
-        0
+fn refill(bucket: &mut (u8, Instant), now: Instant, interval: Duration, cap: u8) {
+    let elapsed = now.duration_since(bucket.1);
+    let intervals = elapsed.as_nanos() / interval.as_nanos();
+    if intervals == 0 {
+        return;
     }
-    *SHUTDOWN
-        .lock()
-        .map_err(|_| Error::new(ErrorClass::Http, "console handler mutex poisoned"))? =
-        Some(shutdown);
-    // SAFETY: the handler has static lifetime and accesses only synchronized state.
-    if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(handler), 1) } == 0
-    {
-        return Err(Error::new(ErrorClass::Http, "SetConsoleCtrlHandler failed"));
-    }
-    Ok(())
+    let added = intervals.min(u128::from(cap)) as u8;
+    bucket.0 = bucket.0.saturating_add(added).min(cap);
+    let remainder = elapsed.as_nanos() % interval.as_nanos();
+    bucket.1 = now
+        .checked_sub(Duration::from_nanos(remainder as u64))
+        .unwrap_or(now);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Shutdown;
+    use actix_web::body::to_bytes;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
 
-    struct FakeWatch {
-        results: VecDeque<std::result::Result<WatchResult, Error>>,
-    }
+    #[test]
+    fn rate_limiter_refills_incrementally_and_caps_bursts() {
+        let start = Instant::now();
+        let source = IpAddr::from([127, 0, 0, 1]);
+        let mut limiter = RateLimiter {
+            sources: HashMap::new(),
+            global: (10, start),
+        };
+        assert!(limiter.allow_at(source, start));
+        assert!(limiter.allow_at(source, start));
+        assert!(limiter.allow_at(source, start));
+        assert!(!limiter.allow_at(source, start + Duration::from_secs(5)));
+        assert!(limiter.allow_at(source, start + Duration::from_secs(6)));
+        assert!(!limiter.allow_at(source, start + Duration::from_secs(11)));
+        assert!(limiter.allow_at(source, start + Duration::from_secs(12)));
+        assert_eq!(limiter.sources[&source].0, 0);
+        assert!(limiter.global.0 <= 10);
 
-    impl ChangeWatch for FakeWatch {
-        fn poll(&mut self, _: Duration) -> Result<WatchResult> {
-            self.results.pop_front().unwrap_or(Ok(WatchResult::Timeout))
-        }
-    }
+        let mut global = RateLimiter {
+            sources: HashMap::new(),
+            global: (0, start),
+        };
+        assert!(!global.allow_at(source, start + Duration::from_millis(999)));
+        assert!(global.allow_at(source, start + Duration::from_secs(1)));
+        assert!(!global.allow_at(source, start + Duration::from_millis(1_999)));
+        assert!(global.allow_at(source, start + Duration::from_secs(2)));
+        global.allow_at(source, start + Duration::from_secs(100));
+        assert!(global.global.0 <= 10);
 
-    fn socket_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("{error}"));
-        let address = listener
-            .local_addr()
-            .unwrap_or_else(|error| panic!("{error}"));
-        let client = TcpStream::connect(address).unwrap_or_else(|error| panic!("{error}"));
-        let (server, _) = listener.accept().unwrap_or_else(|error| panic!("{error}"));
-        (client, server)
+        let mut source_bucket = (3, start);
+        refill(
+            &mut source_bucket,
+            start + Duration::from_millis(6_500),
+            Duration::from_secs(6),
+            3,
+        );
+        assert_eq!(source_bucket.1, start + Duration::from_secs(6));
+        source_bucket.0 -= 1;
+        refill(
+            &mut source_bucket,
+            start + Duration::from_millis(11_999),
+            Duration::from_secs(6),
+            3,
+        );
+        assert_eq!(source_bucket.0, 2);
+        refill(
+            &mut source_bucket,
+            start + Duration::from_secs(12),
+            Duration::from_secs(6),
+            3,
+        );
+        assert_eq!(source_bucket.0, 3);
+
+        let mut global_bucket = (10, start);
+        refill(
+            &mut global_bucket,
+            start + Duration::from_millis(1_500),
+            Duration::from_secs(1),
+            10,
+        );
+        assert_eq!(global_bucket.1, start + Duration::from_secs(1));
+        global_bucket.0 -= 1;
+        refill(
+            &mut global_bucket,
+            start + Duration::from_millis(1_999),
+            Duration::from_secs(1),
+            10,
+        );
+        assert_eq!(global_bucket.0, 9);
+        refill(
+            &mut global_bucket,
+            start + Duration::from_secs(2),
+            Duration::from_secs(1),
+            10,
+        );
+        assert_eq!(global_bucket.0, 10);
     }
 
     #[test]
-    fn permit_pool_never_exceeds_bound() {
-        for maximum in 1..=64 {
-            let pool = Arc::new(PermitPool::new(maximum));
-            let permits: Vec<_> = (0..maximum).map(|_| pool.try_acquire()).collect();
-            assert!(permits.iter().all(Option::is_some));
-            assert!(pool.try_acquire().is_none());
-        }
-    }
-
-    #[test]
-    fn raw_parser_rejects_bare_lf_and_obs_fold() {
-        assert!(reject_raw_framing(b"GET / HTTP/1.1\n").is_err());
-        assert!(reject_raw_framing(b"GET / HTTP/1.1\r\n folded").is_err());
-    }
-
-    #[test]
-    fn not_found_shape_is_constant() {
-        assert_eq!(not_found().body, not_found().body);
-    }
-
-    #[test]
-    fn absolute_deadline_rejects_slow_header_trickle() {
-        let (mut client, mut server) = socket_pair();
-        let writer = thread::spawn(move || {
-            for byte in b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n" {
-                if client.write_all(&[*byte]).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(35));
-            }
-        });
-        let started = Instant::now();
-        assert!(read_request(&mut server, 1024, started + Duration::from_millis(150)).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let _ = server.shutdown(Shutdown::Both);
-        writer.join().unwrap_or_else(|_| panic!("writer panicked"));
-    }
-
-    #[test]
-    fn absolute_deadline_rejects_slow_body_trickle() {
-        let (mut client, mut server) = socket_pair();
-        let writer = thread::spawn(move || {
-            let _ = client.write_all(
-                b"POST /v1/certificates HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\n",
+    fn public_json_contracts_are_exact() {
+        actix_web::rt::System::new().block_on(async {
+            let live = livez().await;
+            assert_eq!(
+                to_bytes(live.into_body())
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}")),
+                br#"{"live":true,"schema_version":1}"#.as_slice()
             );
-            for byte in b"12345678" {
-                if client.write_all(&[*byte]).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(35));
+            let error = json_error(StatusCode::CONFLICT, "idempotency_conflict");
+            assert_eq!(
+                to_bytes(error.into_body())
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}")),
+                br#"{"schema_version":1,"error":{"code":"idempotency_conflict","message":"request rejected"}}"#
+                    .as_slice()
+            );
+            let missing = not_found();
+            assert_eq!(
+                to_bytes(missing.into_body())
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}")),
+                br#"{"schema_version":1,"error":{"code":"certificate_not_found","message":"certificate not found"}}"#
+                    .as_slice()
+            );
+            let ready = readiness_response(true);
+            assert_eq!(
+                to_bytes(ready.into_body())
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}")),
+                br#"{"ready":true,"schema_version":1}"#.as_slice()
+            );
+            let metadata = metadata_response("authority");
+            assert_eq!(
+                to_bytes(metadata.into_body())
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}")),
+                br#"{"authority_id":"authority","certificates":"/v1/certificates","root":"/v1/ca/root","schema_version":1}"#
+                    .as_slice()
+            );
+            let status = status_response(
+                r#"{"schema_version":1,"issuance_id":"id","status":"valid"}"#.to_owned(),
+            );
+            assert_eq!(
+                to_bytes(status.into_body())
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}")),
+                br#"{"schema_version":1,"issuance_id":"id","status":"valid"}"#.as_slice()
+            );
+            for (text, code, status) in [
+                (
+                    "san_not_allowed",
+                    "san_not_authorized",
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "idempotency_conflict",
+                    "idempotency_conflict",
+                    StatusCode::CONFLICT,
+                ),
+                (
+                    "san_required",
+                    "san_required",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+                (
+                    "unsupported_csr_profile",
+                    "unsupported_csr_profile",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+                (
+                    "malformed_subject",
+                    "malformed_subject",
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    "malformed_csr",
+                    "malformed_csr",
+                    StatusCode::BAD_REQUEST,
+                ),
+            ] {
+                let response = mapped_error(&Error::new(ErrorClass::Validation, text));
+                assert_eq!(response.status(), status);
+                let expected = format!(
+                    r#"{{"schema_version":1,"error":{{"code":"{code}","message":"request rejected"}}}}"#
+                );
+                assert_eq!(
+                    to_bytes(response.into_body())
+                        .await
+                        .unwrap_or_else(|error| panic!("{error}")),
+                    expected.as_bytes()
+                );
             }
         });
-        let started = Instant::now();
-        assert!(read_request(&mut server, 1024, started + Duration::from_millis(150)).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let _ = server.shutdown(Shutdown::Both);
-        writer.join().unwrap_or_else(|_| panic!("writer panicked"));
     }
 
     #[test]
-    fn expired_response_deadline_releases_the_connection() {
-        let (_client, mut server) = socket_pair();
-        let started = Instant::now();
-        let result = write_response(
-            &mut server,
-            json_response(200, json!({"schema_version":1,"live":true})),
-            started,
-        );
-        assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
+    fn accept_deadline_bounds_headers_body_queue_and_releases_permits() {
+        let (port, server, server_thread, blocking_state) = deadline_server();
 
-    #[test]
-    fn queued_socket_keeps_accept_deadline_and_releases_permit() {
-        let (client, server) = socket_pair();
-        let pool = Arc::new(PermitPool::new(1));
-        let permit = pool
-            .try_acquire()
-            .unwrap_or_else(|| panic!("permit unavailable"));
-        let queue = SocketQueue::new(1);
-        let shutdown = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_millis(80);
-        assert!(
-            queue.push(
-                AdmittedSocket {
-                    stream: server,
-                    source: "127.0.0.1"
-                        .parse()
-                        .unwrap_or_else(|error| panic!("{error}")),
-                    deadline,
-                    _permit: permit,
-                },
-                &shutdown,
-            )
-        );
-        thread::sleep(Duration::from_millis(120));
-        let admitted = queue
-            .pop(&shutdown)
-            .unwrap_or_else(|| panic!("queued socket missing"));
-        assert!(Instant::now() >= admitted.deadline);
-        drop(admitted);
-        drop(client);
-        assert!(pool.try_acquire().is_some());
-    }
-
-    #[test]
-    fn queue_delay_cannot_reset_request_budget() {
-        let (mut client, mut server) = socket_pair();
-        client
-            .write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        let start = Instant::now();
+        let mut slow_header =
+            TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|error| panic!("{error}"));
+        slow_header
+            .write_all(b"GET /fast HTTP/1.1\r\nHost:")
             .unwrap_or_else(|error| panic!("{error}"));
-        let accepted_deadline = Instant::now() + Duration::from_millis(80);
-        thread::sleep(Duration::from_millis(120));
-        let started = Instant::now();
-        assert!(read_request(&mut server, 1024, accepted_deadline).is_err());
-        assert!(started.elapsed() < Duration::from_millis(50));
+        slow_header
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut response = Vec::new();
+        let _ = slow_header.read_to_end(&mut response);
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let start = Instant::now();
+        let mut slow_body =
+            TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|error| panic!("{error}"));
+        slow_body
+            .write_all(b"POST /body HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\na")
+            .unwrap_or_else(|error| panic!("{error}"));
+        slow_body
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        response.clear();
+        slow_body
+            .read_to_end(&mut response)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            response.starts_with(b"HTTP/1.1 408") || response.starts_with(b"HTTP/1.1 503"),
+            "unexpected slow-body response: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let response = raw_request(port, b"GET /delay HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(
+            response.starts_with(b"HTTP/1.1 408") || response.starts_with(b"HTTP/1.1 503"),
+            "unexpected delayed response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        let fast_start = Instant::now();
+        let response = raw_request(port, b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected recovery response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(fast_start.elapsed() < Duration::from_millis(150));
+        let mut slow_reader =
+            TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|error| panic!("{error}"));
+        slow_reader
+            .write_all(b"GET /slow-response HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut second_slow_reader =
+            TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|error| panic!("{error}"));
+        second_slow_reader
+            .write_all(b"GET /slow-response HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let start = Instant::now();
+        thread::sleep(Duration::from_millis(500));
+        let recovery = raw_request(port, b"GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(recovery.starts_with(b"HTTP/1.1 200"));
+        slow_reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut response = Vec::new();
+        slow_reader
+            .read_to_end(&mut response)
+            .unwrap_or_else(|error| panic!("{error}"));
+        second_slow_reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut second_response = Vec::new();
+        second_slow_reader
+            .read_to_end(&mut second_response)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!response.is_empty());
+        assert!(!second_response.is_empty());
+
+        let hold = thread::spawn(move || {
+            raw_request(
+                port,
+                b"GET /blocking/hold HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+        });
+        thread::sleep(Duration::from_millis(30));
+        let queued = thread::spawn(move || {
+            raw_request(
+                port,
+                b"GET /blocking/queued HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+        });
+        thread::sleep(Duration::from_millis(280));
+        assert_eq!(blocking_state.in_flight.load(Ordering::Acquire), 2);
+        assert!(blocking_state.admission.try_acquire().is_err());
+        assert!(blocking_state.blocking.try_acquire().is_err());
+        let _ = hold
+            .join()
+            .unwrap_or_else(|_| panic!("hold client panicked"));
+        let _ = queued
+            .join()
+            .unwrap_or_else(|_| panic!("queued client panicked"));
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(blocking_state.in_flight.load(Ordering::Acquire), 0);
+        assert!(blocking_state.admission.try_acquire().is_ok());
+        assert!(blocking_state.blocking.try_acquire().is_ok());
+        assert_eq!(blocking_state.completed.load(Ordering::Acquire), 2);
+
+        actix_web::rt::System::new().block_on(server.stop(true));
+        server_thread
+            .join()
+            .unwrap_or_else(|_| panic!("deadline test server panicked"));
     }
 
     #[test]
-    fn readiness_rescans_mutation_that_arrives_during_scan() {
-        let mut watcher = FakeWatch {
-            results: VecDeque::from([Ok(WatchResult::Changed), Ok(WatchResult::Timeout)]),
-        };
-        let shutdown = AtomicBool::new(false);
-        let mut scans = 0;
-        assert!(scan_until_quiescent(
-            &mut watcher,
-            &shutdown,
-            || {
-                scans += 1;
-                true
-            },
-            || panic!("replacement was not expected"),
-        ));
-        assert_eq!(scans, 2);
+    fn routing_contract_intercepts_all_method_mismatches() {
+        actix_web::rt::System::new().block_on(async {
+            let app = actix_web::test::init_service(App::new().service(api_scope())).await;
+            for path in [
+                "/livez",
+                "/readyz",
+                "/v1/ca",
+                "/v1/ca/root",
+                "/v1/certificates/0123456789abcdef0123456789abcdef",
+                "/v1/certificates/0123456789abcdef0123456789abcdef/status",
+            ] {
+                assert_contract_response(
+                    actix_web::test::call_service(
+                        &app,
+                        actix_web::test::TestRequest::post().uri(path).to_request(),
+                    )
+                    .await,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                )
+                .await;
+            }
+            assert_contract_response(
+                actix_web::test::call_service(
+                    &app,
+                    actix_web::test::TestRequest::get()
+                        .uri("/v1/certificates")
+                        .to_request(),
+                )
+                .await,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+            )
+            .await;
+            for method in [actix_web::http::Method::GET, actix_web::http::Method::POST] {
+                assert_contract_response(
+                    actix_web::test::call_service(
+                        &app,
+                        actix_web::test::TestRequest::default()
+                            .method(method)
+                            .uri("/unknown")
+                            .to_request(),
+                    )
+                    .await,
+                    StatusCode::NOT_FOUND,
+                    "certificate_not_found",
+                )
+                .await;
+            }
+            assert_contract_response(
+                actix_web::test::call_service(
+                    &app,
+                    actix_web::test::TestRequest::default()
+                        .method(actix_web::http::Method::DELETE)
+                        .uri("/unknown")
+                        .to_request(),
+                )
+                .await,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+            )
+            .await;
+        });
     }
 
-    #[test]
-    fn readiness_replaces_watch_after_every_overflow_before_rescanning() {
-        let mut watcher = FakeWatch {
-            results: VecDeque::from([
-                Ok(WatchResult::Overflow),
-                Ok(WatchResult::Overflow),
-                Ok(WatchResult::Timeout),
-            ]),
+    async fn assert_contract_response<B>(
+        response: ServiceResponse<B>,
+        status: StatusCode,
+        code: &str,
+    ) where
+        B: MessageBody,
+        B::Error: std::fmt::Debug,
+    {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = actix_web::test::read_body(response).await;
+        let message = if code == "certificate_not_found" {
+            "certificate not found"
+        } else {
+            "request rejected"
         };
-        let shutdown = AtomicBool::new(false);
-        let mut scans = 0;
-        let mut replacements = 0;
-        assert!(scan_until_quiescent(
-            &mut watcher,
-            &shutdown,
-            || {
-                scans += 1;
-                true
-            },
-            || {
-                replacements += 1;
-                Ok(FakeWatch {
-                    results: VecDeque::from(if replacements == 1 {
-                        [Ok(WatchResult::Overflow), Ok(WatchResult::Timeout)]
-                    } else {
-                        [Ok(WatchResult::Timeout), Ok(WatchResult::Timeout)]
-                    }),
+        assert_eq!(
+            body,
+            format!(r#"{{"schema_version":1,"error":{{"code":"{code}","message":"{message}"}}}}"#)
+                .as_bytes()
+        );
+    }
+
+    fn deadline_server() -> (
+        u16,
+        actix_web::dev::ServerHandle,
+        thread::JoinHandle<()>,
+        Arc<BlockingTestState>,
+    ) {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|error| panic!("{error}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .port();
+        let blocking_state = Arc::new(BlockingTestState::new());
+        let server_state = web::Data::from(Arc::clone(&blocking_state));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            actix_web::rt::System::new().block_on(async move {
+                let server = HttpServer::new(move || {
+                    App::new()
+                        .app_data(server_state.clone())
+                        .app_data(web::Data::new(DeadlineConfig(Duration::from_millis(250))))
+                        .wrap(actix_web::middleware::from_fn(protocol_middleware))
+                        .route(
+                            "/fast",
+                            web::get().to(|| async { HttpResponse::Ok().finish() }),
+                        )
+                        .route(
+                            "/delay",
+                            web::get().to(|| async {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                HttpResponse::Ok().finish()
+                            }),
+                        )
+                        .route(
+                            "/body",
+                            web::post()
+                                .to(|_: Pkcs10Request| async { HttpResponse::Ok().finish() }),
+                        )
+                        .route(
+                            "/slow-response",
+                            web::get().to(|| async {
+                                HttpResponse::Ok().body(vec![0_u8; 64 * 1024 * 1024])
+                            }),
+                        )
+                        .route("/blocking/{kind}", web::get().to(blocking_test))
                 })
-            },
-        ));
-        assert_eq!(scans, 3);
-        assert_eq!(replacements, 2);
+                .workers(1)
+                .max_connections(2)
+                .client_request_timeout(Duration::from_secs(1))
+                .keep_alive(KeepAlive::Disabled)
+                .on_connect(|io, extensions| {
+                    register_connection_deadline(io, extensions, Duration::from_millis(250));
+                })
+                .listen(listener)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .run();
+                sender
+                    .send(server.handle())
+                    .unwrap_or_else(|error| panic!("{error}"));
+                server.await.unwrap_or_else(|error| panic!("{error}"));
+            });
+        });
+        let handle = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|error| panic!("{error}"));
+        (port, handle, thread, blocking_state)
     }
 
-    #[test]
-    fn startup_readiness_fails_closed_on_scan_or_replacement_failure() {
-        let shutdown = AtomicBool::new(false);
-        let mut scan_failure = FakeWatch {
-            results: VecDeque::from([Ok(WatchResult::Timeout)]),
-        };
-        assert!(!scan_until_quiescent(
-            &mut scan_failure,
-            &shutdown,
-            || false,
-            || panic!("replacement was not expected"),
-        ));
+    fn raw_request(port: u16, request: &[u8]) -> Vec<u8> {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|error| panic!("{error}"));
+        stream
+            .write_all(request)
+            .unwrap_or_else(|error| panic!("{error}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .unwrap_or_else(|error| panic!("{error}"));
+        response
+    }
 
-        let mut replacement_failure = FakeWatch {
-            results: VecDeque::from([Ok(WatchResult::Overflow)]),
-        };
-        assert!(!scan_until_quiescent(
-            &mut replacement_failure,
-            &shutdown,
-            || true,
-            || Err(Error::new(ErrorClass::State, "replacement failed")),
-        ));
+    struct BlockingTestState {
+        admission: Arc<Semaphore>,
+        blocking: Arc<Semaphore>,
+        in_flight: Arc<AtomicUsize>,
+        completed: AtomicUsize,
+        gate: Mutex<()>,
+    }
+
+    impl BlockingTestState {
+        fn new() -> Self {
+            Self {
+                admission: Arc::new(Semaphore::new(2)),
+                blocking: Arc::new(Semaphore::new(2)),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                completed: AtomicUsize::new(0),
+                gate: Mutex::new(()),
+            }
+        }
+    }
+
+    async fn blocking_test(
+        request: HttpRequest,
+        path: web::Path<String>,
+        state: web::Data<BlockingTestState>,
+    ) -> HttpResponse {
+        let deadline = request.extensions().get::<RequestDeadline>().map_or_else(
+            || Instant::now() + Duration::from_millis(200),
+            |value| value.processing,
+        );
+        let admission = Arc::clone(&state.admission)
+            .try_acquire_owned()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let blocking = Arc::clone(&state.blocking)
+            .try_acquire_owned()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let state = state.into_inner();
+        let kind = path.into_inner();
+        let job = actix_web::rt::task::spawn_blocking(move || {
+            let _guard = InFlightGuard::new(Arc::clone(&state.in_flight));
+            let _permits = (admission, blocking);
+            let _gate = state.gate.lock().unwrap_or_else(|error| panic!("{error}"));
+            if kind == "hold" {
+                thread::sleep(Duration::from_millis(500));
+            }
+            state.completed.fetch_add(1, Ordering::AcqRel);
+        });
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), job).await {
+            Ok(_) => HttpResponse::Ok().finish(),
+            Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+        }
     }
 }

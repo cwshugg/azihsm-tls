@@ -50,7 +50,7 @@ fn enrollment_survives_server_restart() {
     let csr = root.join("request.der");
     fs::write(
         &inf,
-        "[Version]\r\nSignature=\"$Windows NT$\"\r\n[NewRequest]\r\nSubject=\"CN=server.demo.internal\"\r\nExportable=FALSE\r\nMachineKeySet=FALSE\r\nProviderName=\"Microsoft Software Key Storage Provider\"\r\nKeyAlgorithm=ECDSA_P256\r\nKeySpec=0\r\nHashAlgorithm=SHA256\r\nKeyUsage=0x80\r\nRequestType=PKCS10\r\nSuppressDefaults=TRUE\r\nSMIME=FALSE\r\n[Extensions]\r\n2.5.29.17=\"{text}\"\r\n_continue_=\"DNS=server.demo.internal\"\r\n",
+        "[Version]\r\nSignature=\"$Windows NT$\"\r\n[NewRequest]\r\nSubject=\"CN=server.demo.internal\"\r\nExportable=FALSE\r\nMachineKeySet=FALSE\r\nProviderName=\"Microsoft Software Key Storage Provider\"\r\nKeyAlgorithm=ECDSA_P256\r\nKeySpec=0\r\nHashAlgorithm=SHA256\r\nRequestType=PKCS10\r\nSuppressDefaults=TRUE\r\nSMIME=FALSE\r\n[Extensions]\r\n2.5.29.17=\"{text}\"\r\n_continue_=\"DNS=server.demo.internal\"\r\n",
     )
     .unwrap_or_else(|error| panic!("{error}"));
     let status = Command::new("certreq.exe")

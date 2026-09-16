@@ -12,12 +12,10 @@ fn product_has_no_prohibited_dependencies_or_fault_controls() {
         fs::read_to_string(root.join("Cargo.toml")).unwrap_or_else(|error| panic!("{error}"));
     for prohibited in [
         "openssl",
-        "ring",
         "rustls",
         "aws-lc",
         "native-tls",
         "webpki",
-        "tokio",
         "async-std",
         "smol",
         "hyper",
@@ -37,9 +35,29 @@ fn product_has_no_prohibited_dependencies_or_fault_controls() {
         "CRASH_AFTER",
         "FAIL_AFTER",
         "verify endpoint",
+        "rcgen::KeyPair",
+        "generate_simple_self_signed",
+        "EcdsaKeyPair",
+        "Ed25519KeyPair",
+        "BCryptOpen",
+        "BCryptCreate",
+        "BCryptHash",
+        "BCryptFinish",
+        "BCryptDestroy",
+        "BCryptClose",
+        "BCryptGenRandom",
+        "BCryptGenerateKeyPair",
+        "BCryptImportKeyPair",
+        "BCryptVerifySignature",
     ] {
         assert!(!source.contains(prohibited), "found {prohibited}");
     }
+    assert!(!manifest.contains("futures-util ="));
+    assert_eq!(
+        source.matches("NCryptSignHash(").count(),
+        1,
+        "expected one production FFI seam"
+    );
 }
 
 fn collect_rs(path: &Path, output: &mut String) {

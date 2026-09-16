@@ -10,6 +10,8 @@ pub mod cert;
 #[cfg(windows)]
 pub mod cli;
 #[cfg(windows)]
+pub mod crypto;
+#[cfg(windows)]
 pub mod csr;
 #[cfg(windows)]
 pub mod error;

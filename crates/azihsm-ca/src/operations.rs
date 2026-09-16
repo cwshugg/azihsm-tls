@@ -11,7 +11,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     match parse(arguments)? {
-        Command::Help => Ok(Some(crate::cli::help())),
+        Command::Help(message) => Ok(Some(message)),
         Command::Init(args) => {
             authority::initialize(args)?;
             Ok(None)
@@ -25,6 +25,7 @@ where
             Ok(None)
         }
         Command::Serve(args) => {
+            crate::state::validate_state_format(&args.state_dir)?;
             let _lock = StateLock::acquire(&args.state_dir, false)?;
             let loaded = authority::load_for_serve(&args.state_dir)?;
             crate::http::serve(args, loaded)?;

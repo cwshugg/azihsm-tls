@@ -1,13 +1,18 @@
 //! Registered-provider NCrypt operations for user-scoped named P-256 keys.
 
+use crate::crypto::{hash_sha256, public_point, random, verify_p256_sha256};
 use crate::error::{Error, ErrorClass, Result};
 use crate::policy::{MAX_ECC_BLOB, MAX_SIGNATURE};
-use crate::win::bcrypt::{hash_sha256, import_public, validate_public_blob};
 use crate::win::handles::{NcryptKey, NcryptProvider};
 use crate::win::status_error;
 use std::ptr::{null, null_mut};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::NTE_BAD_KEYSET;
 use windows_sys::Win32::Security::Cryptography::*;
+
+#[cfg(test)]
+static SIGN_HASH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 pub const E_UNEXPECTED_STATUS: i32 = 0x8000_ffff_u32 as i32;
 
@@ -152,58 +157,58 @@ impl AziKey {
                 status,
             ));
         }
-        validate_public_blob(&blob)?;
+        public_point(&blob)?;
         Ok(blob)
     }
 
     pub fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
         let mut size = 0;
-        // SAFETY: null output is the documented sizing call.
-        let status = unsafe {
-            NCryptSignHash(
-                self.key.0,
-                null(),
-                digest.as_ptr(),
-                digest.len() as u32,
-                null_mut(),
-                0,
-                &mut size,
-                0,
-            )
-        };
+        let status = ncrypt_sign_hash(self.key.0, digest, None, &mut size);
         if status < 0 || size != 64 || size as usize > MAX_SIGNATURE {
             return Err(status_error(
                 ErrorClass::Issuance,
-                "NCryptSignHash(size)",
+                "NCryptSignHash sizing",
                 status,
             ));
         }
         let mut signature = [0; 64];
-        // SAFETY: all pointer/length pairs are valid.
-        let status = unsafe {
-            NCryptSignHash(
-                self.key.0,
-                null(),
-                digest.as_ptr(),
-                digest.len() as u32,
-                signature.as_mut_ptr(),
-                signature.len() as u32,
-                &mut size,
-                0,
-            )
-        };
+        let status = ncrypt_sign_hash(self.key.0, digest, Some(&mut signature), &mut size);
         if status < 0 || size != signature.len() as u32 {
             return Err(status_error(ErrorClass::Issuance, "NCryptSignHash", status));
+        }
+
+        fn ncrypt_sign_hash(
+            key: NCRYPT_KEY_HANDLE,
+            digest: &[u8; 32],
+            output: Option<&mut [u8; 64]>,
+            size: &mut u32,
+        ) -> i32 {
+            #[cfg(test)]
+            SIGN_HASH_CALLS.fetch_add(1, Ordering::SeqCst);
+            let (pointer, capacity) = output
+                .map(|bytes| (bytes.as_mut_ptr(), bytes.len() as u32))
+                .unwrap_or((null_mut(), 0));
+            unsafe {
+                NCryptSignHash(
+                    key,
+                    null(),
+                    digest.as_ptr(),
+                    digest.len() as u32,
+                    pointer,
+                    capacity,
+                    size,
+                    0,
+                )
+            }
         }
         Ok(signature)
     }
 
     pub fn kat(&self) -> Result<()> {
-        let challenge = crate::win::bcrypt::random::<32>()?;
+        let challenge = random::<32>()?;
         let digest = hash_sha256(&challenge)?;
         let signature = self.sign(&digest)?;
-        let verifier = import_public(&self.public_blob()?)?;
-        verifier.verify(&digest, &signature)?;
+        verify_p256_sha256(&self.public_blob()?, &challenge, &signature)?;
         Ok(())
     }
 }
@@ -217,4 +222,40 @@ fn wide_status(value: &str) -> std::result::Result<Vec<u16>, i32> {
         return Err(windows_sys::Win32::Foundation::E_INVALIDARG);
     }
     Ok(value.encode_utf16().chain(Some(0)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::SigningKey;
+
+    #[test]
+    #[ignore = "requires registered named AziHSM test provider"]
+    fn production_rcgen_adapter_makes_exactly_two_native_calls() {
+        let provider = AziProvider::open_named(crate::policy::PROVIDER_NAME)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let key_name = format!(
+            "azihsm-ca-adapter-{}",
+            crate::state::hex(&random::<8>().unwrap_or_else(|error| panic!("{error}")))
+        );
+        provider
+            .require_absent(&key_name)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut key = provider
+            .create_named_staged(&key_name)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(key.finalize(), 0);
+        let blob = key.public_blob().unwrap_or_else(|error| panic!("{error}"));
+        let adapter = crate::cert::signer::AziHsmSigningKey::new(&key, &blob)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let before = SIGN_HASH_CALLS.load(Ordering::SeqCst);
+        adapter
+            .sign(b"production adapter call-count proof")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(SIGN_HASH_CALLS.load(Ordering::SeqCst) - before, 2);
+        drop(adapter);
+        let status = unsafe { NCryptDeleteKey(key.key.0, 0) };
+        assert_eq!(status, 0);
+        key.key.disarm();
+    }
 }

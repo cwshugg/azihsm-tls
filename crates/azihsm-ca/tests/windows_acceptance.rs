@@ -2,8 +2,8 @@
 
 #![cfg(windows)]
 
+use azihsm_ca::crypto::hash_sha256;
 use azihsm_ca::state::hex;
-use azihsm_ca::win::bcrypt::hash_sha256;
 use azihsm_ca::win::crypt32::{CertContext, verify_certificate_signature, verify_exclusive_chain};
 use std::env;
 use std::fs;
@@ -46,6 +46,7 @@ fn validate_cross_vm_enrollment_artifacts() {
             blob[8..].copy_from_slice(&point[1..]);
             blob
         })
+        .unwrap_or_else(|error| panic!("{error}"))
     };
     assert_eq!(
         hex(&hash_sha256(&spki).unwrap_or_else(|error| panic!("{error}"))),

@@ -1,7 +1,7 @@
 //! Persistent schemas, path validation, exclusive locking, and durable publication.
 
+use crate::crypto::hash_sha256;
 use crate::error::{Error, ErrorClass, Result};
-use crate::win::bcrypt::hash_sha256;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -40,10 +40,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const STATE_FORMAT_VERSION: u32 = 1;
+pub const STATE_PRODUCER: &str = "azihsm-ca-rcgen-actix-v1";
 pub const DIRECTORY_NAMES: [&str; 6] = [
     "init-intents",
     "issuances",
@@ -52,6 +55,41 @@ pub const DIRECTORY_NAMES: [&str; 6] = [
     "idempotency",
     "audit",
 ];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StateFormat {
+    pub format_version: u32,
+    pub producer: String,
+}
+
+pub fn publish_state_format(state_dir: &Path) -> Result<()> {
+    let path = state_dir.join("state-format.json");
+    if path.exists() || pending_publication_path(&path)?.exists() {
+        return Err(state_error("state format marker already exists"));
+    }
+    durable_json(
+        &path,
+        &StateFormat {
+            format_version: STATE_FORMAT_VERSION,
+            producer: STATE_PRODUCER.to_owned(),
+        },
+    )?;
+    validate_state_format(state_dir)
+}
+
+pub fn validate_state_format(state_dir: &Path) -> Result<()> {
+    let path = state_dir.join("state-format.json");
+    if pending_publication_path(&path)?.exists() {
+        return Err(state_error("pending state format marker is forbidden"));
+    }
+    let marker: StateFormat = read_json(&path, 4096)
+        .map_err(|_| state_error("missing, malformed, or pre-pivot state format marker"))?;
+    if marker.format_version != STATE_FORMAT_VERSION || marker.producer != STATE_PRODUCER {
+        return Err(state_error("unsupported state format version or producer"));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +106,8 @@ pub struct Authority {
     pub root_sha256: String,
     pub root_serial: String,
     pub root_subject: String,
+    pub root_subject_der_hex: String,
+    pub root_ski_hex: String,
     pub not_before: String,
     pub not_after: String,
     pub profile: String,
@@ -340,6 +380,28 @@ impl DirectoryWatcher {
         }
     }
 
+    pub fn wait_with_stop(
+        &mut self,
+        stop_event: HANDLE,
+        timeout: Duration,
+    ) -> Result<Option<WatchResult>> {
+        let handles = [stop_event, self.event];
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let result = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, milliseconds) };
+        if result == WAIT_OBJECT_0 {
+            return Ok(None);
+        }
+        if result == WAIT_TIMEOUT {
+            return Ok(Some(WatchResult::Timeout));
+        }
+        if result != WAIT_OBJECT_0 + 1 {
+            return Err(state_error(format!(
+                "WaitForMultipleObjects for state watcher failed with {result}"
+            )));
+        }
+        self.wait(Duration::ZERO).map(Some)
+    }
+
     fn arm(&mut self) -> Result<()> {
         let filters = FILE_NOTIFY_CHANGE_FILE_NAME
             | FILE_NOTIFY_CHANGE_DIR_NAME
@@ -420,7 +482,7 @@ fn validate_notifications(bytes: &[u8]) -> Result<()> {
                 | FILE_ACTION_MODIFIED
                 | FILE_ACTION_RENAMED_OLD_NAME
                 | FILE_ACTION_RENAMED_NEW_NAME
-        ) || name_bytes % 2 != 0
+        ) || !name_bytes.is_multiple_of(2)
             || offset
                 .checked_add(12 + name_bytes)
                 .is_none_or(|end| end > bytes.len())
@@ -1338,5 +1400,26 @@ mod tests {
         fs::read_dir(&after).unwrap_or_else(|error| panic!("{error}"));
 
         fs::remove_dir_all(&parent).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn state_format_is_fresh_only_and_exact() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let path = test_path("state-format");
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")))
+            .unwrap_or_else(|error| panic!("{error}"));
+        create_state_layout(&path).unwrap_or_else(|error| panic!("{error}"));
+        assert!(validate_state_format(&path).is_err());
+        publish_state_format(&path).unwrap_or_else(|error| panic!("{error}"));
+        validate_state_format(&path).unwrap_or_else(|error| panic!("{error}"));
+        assert!(publish_state_format(&path).is_err());
+        fs::write(
+            path.join("state-format.json"),
+            br#"{"format_version":2,"producer":"azihsm-ca-rcgen-actix-v1"}"#,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(validate_state_format(&path).is_err());
+        fs::remove_dir_all(&path).unwrap_or_else(|error| panic!("{error}"));
     }
 }
