@@ -1,0 +1,63 @@
+//! AziHSM-backed TLS 1.3 framed echo server.
+
+#![cfg_attr(not(windows), allow(dead_code))]
+
+#[cfg(not(windows))]
+compile_error!("azihsm-tls-server is Windows-only");
+
+mod ca_cli;
+pub mod cli;
+pub mod frame;
+mod identity;
+pub mod logging;
+pub mod server;
+pub mod tls;
+mod workflow;
+
+use crate::identity::{
+    ServerPrepareOptions, delete_server_key, prepare_server_identity, show_server_identity,
+};
+pub use azihsm_ca_client::transcript;
+pub use azihsm_ncrypt::{Error, ErrorClass, Result};
+use clap::Parser;
+use cli::{Cli, Command};
+use time::OffsetDateTime;
+
+pub fn main_entry() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    logging::init()?;
+    transcript::private_key_notice();
+    match cli.command {
+        Command::Run(args) => {
+            ca_cli::validate_sans(&args.dns, &args.ip)?;
+            tracing::info!(event = "command_started", command = "run");
+            let identity = prepare_server_identity(ServerPrepareOptions {
+                state_dir: args.state_dir,
+                dns: args.dns,
+                ips: args.ip,
+                ca_url: args.ca_url,
+                key_name: args.key_name,
+                now: OffsetDateTime::now_utc(),
+            })?;
+            let config = tls::build_server_config(&identity)?;
+            let not_after = identity.not_after;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(server::run(args.listen, config, not_after))?;
+            drop(identity);
+            tracing::info!(event = "command_completed", command = "run");
+        }
+        Command::Show(args) => {
+            tracing::info!(event = "command_started", command = "show");
+            show_server_identity(&args.state_dir)?;
+            tracing::info!(event = "command_completed", command = "show");
+        }
+        Command::DeleteKey(args) => {
+            tracing::info!(event = "command_started", command = "delete-key");
+            delete_server_key(&args.state_dir, args.confirm_key_name)?;
+            tracing::info!(event = "command_completed", command = "delete-key");
+        }
+    }
+    Ok(())
+}

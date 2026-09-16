@@ -1,5 +1,10 @@
 # AziHSM CA Enrollment Demo Guide
 
+`azihsm-ca-demo` is a standalone application. It shares neutral CA protocol,
+transcript, CSR, and certificate-verification primitives through
+`azihsm-ca-client`, but it does not depend on `azihsm-tls-server` or share the
+server application's state. Guide
+
 This guide operates the Windows-only `azihsm-ca-demo` client against the
 repository's demonstration CA. For CA setup and API details, see the
 [CA server operator guide](ca-server-usage.md).
@@ -118,6 +123,11 @@ returns `200` with the same issuance ID and leaf bytes.
 subject CN, SANs, CSR/SPKI hashes, authority and issuance IDs, certificate
 hashes, verification time, and deletion status. It does not open or print a
 private key.
+
+Every command holds the shared `.azihsm-state.lock` for its complete
+operation. If `azihsm-tls-server` is using the same state directory, create,
+retry, show, and delete fail closed until the server has drained and released
+the lock.
 
 ## Delete the Key
 

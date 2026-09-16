@@ -3,6 +3,26 @@
 use crate::{Error, ErrorClass, Result};
 use azihsm_ncrypt::hash_sha256;
 use serde::Serialize;
+use std::sync::Arc;
+
+/// Receives complete deterministic transcript records.
+pub trait TranscriptSink: Send + Sync {
+    fn write(&self, record: &str);
+}
+
+/// Default transcript sink that writes each complete record to stdout.
+#[derive(Debug, Default)]
+pub struct StdoutTranscript;
+
+impl TranscriptSink for StdoutTranscript {
+    fn write(&self, record: &str) {
+        println!("{record}");
+    }
+}
+
+pub fn default_sink() -> Arc<dyn TranscriptSink> {
+    Arc::new(StdoutTranscript)
+}
 
 pub fn private_key_notice() {
     println!(
@@ -16,18 +36,25 @@ pub fn http_request(
     headers: &[(&str, &str)],
     body: Option<Body<'_>>,
 ) -> Result<()> {
-    println!(
-        "{}",
-        render_exchange(
-            "HTTP REQUEST",
-            "outbound",
-            method,
-            path,
-            None,
-            headers,
-            body
-        )?
-    );
+    http_request_to(default_sink().as_ref(), method, path, headers, body)
+}
+
+pub fn http_request_to(
+    sink: &dyn TranscriptSink,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<Body<'_>>,
+) -> Result<()> {
+    sink.write(&render_exchange(
+        "HTTP REQUEST",
+        "outbound",
+        method,
+        path,
+        None,
+        headers,
+        body,
+    )?);
     Ok(())
 }
 
@@ -38,18 +65,26 @@ pub fn http_response(
     headers: &[(&str, &str)],
     body: Body<'_>,
 ) -> Result<()> {
-    println!(
-        "{}",
-        render_exchange(
-            "HTTP RESPONSE",
-            "inbound",
-            method,
-            path,
-            Some(status),
-            headers,
-            Some(body),
-        )?
-    );
+    http_response_to(default_sink().as_ref(), method, path, status, headers, body)
+}
+
+pub fn http_response_to(
+    sink: &dyn TranscriptSink,
+    method: &str,
+    path: &str,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: Body<'_>,
+) -> Result<()> {
+    sink.write(&render_exchange(
+        "HTTP RESPONSE",
+        "inbound",
+        method,
+        path,
+        Some(status),
+        headers,
+        Some(body),
+    )?);
     Ok(())
 }
 
@@ -68,7 +103,7 @@ pub enum Body<'a> {
     Pem { tag: &'a str, bytes: &'a [u8] },
 }
 
-fn render_exchange(
+pub fn render_exchange(
     title: &str,
     direction: &str,
     method: &str,
@@ -127,6 +162,38 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemorySink(Mutex<Vec<String>>);
+
+    impl TranscriptSink for MemorySink {
+        fn write(&self, record: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .push(record.to_owned());
+        }
+    }
+
+    #[test]
+    fn configurable_sink_receives_complete_record() {
+        let sink = MemorySink::default();
+        http_request_to(
+            &sink,
+            "GET",
+            "/readyz",
+            &[("Accept", "application/json")],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let records = sink.0.lock().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0],
+            "=== HTTP REQUEST ===\nDirection: outbound\nMethod: GET\nPath: /readyz\nAccept: application/json\n=== END HTTP REQUEST ==="
+        );
+    }
 
     #[test]
     fn json_transcript_is_exact_and_pretty() {

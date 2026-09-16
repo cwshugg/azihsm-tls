@@ -1,5 +1,6 @@
 [workspace]
-members = ["azihsm-ca", "azihsm-ca-demo", "azihsm-ncrypt", "keytool"]
+members = ["azihsm-ca",
+"azihsm-ca-client", "azihsm-ca-demo", "azihsm-ncrypt", "azihsm-tls-server", "keytool"]
 resolver = "3"
 
 [workspace.package]

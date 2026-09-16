@@ -1,0 +1,29 @@
+[package]
+name = "azihsm-ca-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Neutral bounded client for the AziHSM demonstration CA protocol"
+repository = "https://github.com/cwshugg/azihsm-tls"
+
+[dependencies]
+azihsm-ncrypt = { path = "../azihsm-ncrypt" }
+pem = "=3.0.6"
+rcgen = { version = "=0.14.10", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+ureq = { version = "=3.4.2", default-features = false }
+x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

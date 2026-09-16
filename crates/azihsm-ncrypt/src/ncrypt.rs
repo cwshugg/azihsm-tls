@@ -3,13 +3,14 @@
 use crate::handles::{NcryptKey, NcryptProvider};
 use crate::{Error, ErrorClass, Result, hash_sha256, public_point, random, verify_p256_sha256};
 use std::ptr::{null, null_mut};
-#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::NTE_BAD_KEYSET;
 use windows_sys::Win32::Security::Cryptography::*;
 
 #[cfg(test)]
 static SIGN_HASH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static LOGICAL_SIGNATURES: AtomicUsize = AtomicUsize::new(0);
 
 pub const PROVIDER_NAME: &str = "Microsoft Azure Integrated HSM Key Storage Provider";
 pub const E_UNEXPECTED_STATUS: i32 = 0x8000_ffff_u32 as i32;
@@ -105,6 +106,69 @@ impl AzihsmProvider {
 #[derive(Debug)]
 pub struct AzihsmKey {
     key: NcryptKey,
+}
+
+/// Owns one provider and one named key for the full signing lifetime.
+///
+/// Field order is intentional: Rust drops `key` before `provider`.
+#[derive(Debug)]
+pub struct AzihsmSession {
+    key: Mutex<AzihsmKey>,
+    provider: AzihsmProvider,
+}
+
+impl AzihsmSession {
+    /// Opens an existing current-user named key and keeps its provider alive.
+    pub fn open(provider_name: &str, key_name: &str) -> Result<Self> {
+        let provider = AzihsmProvider::open_named(provider_name)?;
+        let key = provider.open_key(key_name).map_err(|status| {
+            status_error(ErrorClass::Provider, "NCryptOpenKey(session)", status)
+        })?;
+        Ok(Self {
+            key: Mutex::new(key),
+            provider,
+        })
+    }
+
+    /// Runs the provider-backed key self-test.
+    pub fn kat(&self) -> Result<()> {
+        self.lock()?.kat()
+    }
+
+    /// Exports only the public P-256 blob.
+    pub fn public_blob(&self) -> Result<[u8; 72]> {
+        self.lock()?.public_blob()
+    }
+
+    /// Signs one SHA-256 digest and records one logical production signature.
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
+        tracing::debug!(event = "certificate_verify_sign_started");
+        let signature = self.lock()?.sign(digest)?;
+        LOGICAL_SIGNATURES.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(event = "certificate_verify_sign_completed");
+        Ok(signature)
+    }
+
+    /// Deletes the uniquely owned named key while its provider remains live.
+    pub fn delete(self) -> Result<()> {
+        let key = self.key.into_inner().map_err(|_| {
+            Error::new(ErrorClass::Provider, "AziHSM key session mutex is poisoned")
+        })?;
+        key.delete()?;
+        drop(self.provider);
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, AzihsmKey>> {
+        self.key
+            .lock()
+            .map_err(|_| Error::new(ErrorClass::Provider, "AziHSM key session mutex is poisoned"))
+    }
+}
+
+/// Returns the process-wide count of completed logical session signatures.
+pub fn logical_signature_count() -> usize {
+    LOGICAL_SIGNATURES.load(Ordering::SeqCst)
 }
 
 impl AzihsmKey {
@@ -253,6 +317,36 @@ fn wide_status(value: &str) -> std::result::Result<Vec<u16>, i32> {
 mod tests {
     use super::*;
     use rcgen::SigningKey;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn owned_session_field_order_drops_key_before_provider() {
+        #[derive(Debug)]
+        struct Marker(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                self.1
+                    .lock()
+                    .unwrap_or_else(|error| panic!("{error}"))
+                    .push(self.0);
+            }
+        }
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Session {
+            key: Marker,
+            provider: Marker,
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        drop(Session {
+            key: Marker("key", Arc::clone(&order)),
+            provider: Marker("provider", Arc::clone(&order)),
+        });
+        assert_eq!(
+            *order.lock().unwrap_or_else(|error| panic!("{error}")),
+            ["key", "provider"]
+        );
+    }
 
     #[test]
     #[ignore = "requires registered named AziHSM test provider"]

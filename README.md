@@ -24,8 +24,8 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 |----------|------------|-----------------|
 | Implement Mock CA | Done | See [`azihsm-ca`](crates/azihsm-ca) |
 | Initialize named TLS keys | Done | See [`keytool`](crates/keytool) |
-| Implement TLS Server | TODO | |
-| Test TLS-Server-to-Mock-CA certificate issuing | TODO |
+| Implement TLS Server | Done | See [`azihsm-tls-server`](crates/azihsm-tls-server) |
+| Test TLS-Server-to-Mock-CA certificate issuing | Done | See the [TLS server guide](docs/azihsm-tls-server.md) |
 | Implement TLS Client | TODO | |
 | Test TLS-Client-to-TLS-Server communication | TODO | |
 | Test full workflow | TODO | |
@@ -36,8 +36,10 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 This repo contains multiple Rust crates:
 
 * [`azihsm-ca`](crates/azihsm-ca) - A mock CA (Certificate Authority) server.
+* [`azihsm-ca-client`](crates/azihsm-ca-client) - Neutral CA protocol, transcript, CSR, and certificate-verification primitives shared by `azihsm-ca-demo` and `azihsm-tls-server`.
 * [`azihsm-ca-demo`](crates/azihsm-ca-demo) - A sample application demonstrating how a client would communicate with the mock CA server (`azihsm-ca`).
 * [`azihsm-ncrypt`](crates/azihsm-ncrypt) - A helper crate implementing shared code to interact with the AziHSM KSP in Windows.
+* [`azihsm-tls-server`](crates/azihsm-tls-server) - A TLS 1.3 framed echo server whose persistent private key remains in AziHSM.
 * [`keytool`](crates/keytool) - A CLI that initializes and exercises named AziHSM TLS keys (the key-management foundation for the TLS Server).
 
 ## Quick Start
@@ -79,6 +81,23 @@ In a second PowerShell terminal:
 
 The TLS private key remains non-exportable in AziHSM; the demo prints its
 public wire transcript.
+
+To enroll and run the actual TLS server instead, build
+`azihsm-tls-server` and follow the
+[TLS server guide](docs/azihsm-tls-server.md). The demo and server are
+independent applications that share only neutral libraries; use separate
+state directories.
+
+```powershell
+cargo build --locked --manifest-path .\crates\Cargo.toml `
+    -p azihsm-tls-server --release --target x86_64-pc-windows-msvc
+
+.\crates\target\x86_64-pc-windows-msvc\release\azihsm-tls-server.exe run `
+    --state-dir C:\azihsm-demo\tls-service `
+    --dns server.demo `
+    --ca-url http://127.0.0.1:8080 `
+    --acknowledge-plain-http
+```
 
 ## Learning Resources
 

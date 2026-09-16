@@ -11,7 +11,7 @@ fn demo_has_no_private_export_overwrite_or_software_signer_path() {
     let manifest =
         fs::read_to_string(root.join("Cargo.toml")).unwrap_or_else(|error| panic!("{error}"));
     for exact in [
-        "ureq = { version = \"=3.4.2\", default-features = false }",
+        "azihsm-ca-client = { path = \"../azihsm-ca-client\" }",
         "tracing = { version = \"=0.1.44\", default-features = false, features = [\"std\"] }",
         "tracing-subscriber = { version = \"=0.3.23\", default-features = false, features = [\"fmt\", \"std\"] }",
     ] {
@@ -27,6 +27,14 @@ fn demo_has_no_private_export_overwrite_or_software_signer_path() {
         .unwrap_or_else(|| panic!("crate has no workspace parent"))
         .join("azihsm-ncrypt");
     collect(&shared.join("src"), &mut source);
+    let client = root
+        .parent()
+        .unwrap_or_else(|| panic!("crate has no workspace parent"))
+        .join("azihsm-ca-client");
+    let client_manifest =
+        fs::read_to_string(client.join("Cargo.toml")).unwrap_or_else(|error| panic!("{error}"));
+    assert!(client_manifest.contains("ureq = { version = \"=3.4.2\", default-features = false }"));
+    collect(&client.join("src"), &mut source);
     let mut naming_source = source.clone();
     let ca = root
         .parent()

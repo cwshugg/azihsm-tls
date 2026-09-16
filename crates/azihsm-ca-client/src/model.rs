@@ -1,4 +1,4 @@
-//! Versioned, deny-unknown-fields artifact metadata.
+//! Exact public DTOs for the CA HTTP protocol.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,36 @@ pub const CHAIN_PEM: &str = "chain.pem";
 pub const ISSUANCE_METADATA: &str = "issuance-metadata.json";
 pub const DELETION_INTENT: &str = "deletion-intent.json";
 pub const DELETION_RECORD: &str = "deletion-record.json";
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CaMetadata {
+    pub schema_version: u32,
+    pub authority_id: String,
+    pub root: String,
+    pub certificates: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadyResponse {
+    pub schema_version: u32,
+    pub ready: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CaError {
+    pub schema_version: u32,
+    pub error: CaErrorDetail,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CaErrorDetail {
+    pub code: String,
+    pub message: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -92,34 +122,4 @@ pub struct DeletionIntent {
     pub confirmation_key_name: String,
     pub operation_id: String,
     pub requested_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaMetadata {
-    pub schema_version: u32,
-    pub authority_id: String,
-    pub root: String,
-    pub certificates: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReadyResponse {
-    pub schema_version: u32,
-    pub ready: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaError {
-    pub schema_version: u32,
-    pub error: CaErrorDetail,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaErrorDetail {
-    pub code: String,
-    pub message: String,
 }

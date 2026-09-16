@@ -4,6 +4,10 @@
 current-user ECDSA P-256 TLS key through the AziHSM NCrypt provider and
 enrolling it with this repository's demonstration CA.
 
+The executable remains independent from `azihsm-tls-server`. Both applications
+reuse the neutral `azihsm-ca-client` protocol library and `azihsm-ncrypt` key
+library, but do not depend on each other or share application state.
+
 The private key remains non-exportable in AziHSM. The CLI publishes only
 public artifacts and prints a default-on HTTP/local metadata transcript;
 private-key bytes and handles are never exported or printed. RSA generation
