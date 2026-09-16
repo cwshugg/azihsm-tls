@@ -3,6 +3,7 @@
 use crate::model::{CaError, CaMetadata, ReadyResponse};
 use crate::transcript::{self, Body};
 use crate::{Error, ErrorClass, Result};
+use std::net::IpAddr;
 use std::time::Duration;
 
 const JSON_LIMIT: usize = 64 * 1024;
@@ -124,7 +125,13 @@ impl CaClient {
         Ok(body)
     }
 
-    pub fn enroll(&self, csr: &[u8], idempotency_key: &str) -> Result<Enrollment> {
+    pub fn enroll(
+        &self,
+        csr: &[u8],
+        idempotency_key: &str,
+        dns_sans: &[String],
+        ip_sans: &[IpAddr],
+    ) -> Result<Enrollment> {
         tracing::info!(event = "enrollment_started");
         let url = self.url("/v1/certificates");
         transcript::http_request(
@@ -194,7 +201,7 @@ impl CaClient {
             },
         )?;
         if !matches!(status, 200 | 201) {
-            return Err(parse_ca_error(status, &body));
+            return Err(parse_enrollment_error(status, &body, dns_sans, ip_sans));
         }
         require_content_type(content_type.as_deref(), "application/pkix-cert")?;
         if !is_lower_hex_32(&issuance_id) {
@@ -273,6 +280,50 @@ fn parse_ca_error(status: u16, body: &[u8]) -> Error {
     }
 }
 
+fn parse_enrollment_error(
+    status: u16,
+    body: &[u8],
+    dns_sans: &[String],
+    ip_sans: &[IpAddr],
+) -> Error {
+    let Ok(error) = serde_json::from_slice::<CaError>(body) else {
+        return parse_ca_error(status, body);
+    };
+    if error.schema_version != 1
+        || error.error.code.is_empty()
+        || error.error.code != "san_not_authorized"
+    {
+        return parse_ca_error(status, body);
+    }
+
+    let mut message = format!(
+        "CA request failed with HTTP {status}: {}: {}\n\n\
+         SAN authorization guidance:\n\
+         CA --listen controls only network binding; it does not authorize certificate names.\n\
+         Every requested DNS/IP SAN must exactly match a CA --allow-dns/--allow-ip value; \
+         wildcards are not supported.",
+        error.error.code, error.error.message
+    );
+    if !dns_sans.is_empty() {
+        message.push_str("\nRequested DNS SANs (--allow-dns):");
+        for dns in dns_sans {
+            message.push_str(&format!("\n  - {dns:?}"));
+        }
+    }
+    if !ip_sans.is_empty() {
+        message.push_str("\nRequested IP SANs (--allow-ip):");
+        for ip in ip_sans {
+            message.push_str(&format!("\n  - \"{ip}\""));
+        }
+    }
+    message.push_str(
+        "\nAfter restarting or reconfiguring the CA, retry with the existing AziHSM key, CSR, \
+         and idempotency key:\n\
+         azihsm-ca-demo retry --output-dir <OUTPUT_DIR> --acknowledge-plain-http",
+    );
+    Error::new(ErrorClass::Http, message)
+}
+
 fn is_lower_hex_32(value: &str) -> bool {
     value.len() == 32
         && value
@@ -318,7 +369,7 @@ mod tests {
                 Duration::ZERO,
             );
             let enrollment = CaClient::new(&base)
-                .enroll(b"csr", "fedcba9876543210fedcba9876543210")
+                .enroll(b"csr", "fedcba9876543210fedcba9876543210", &[], &[])
                 .unwrap_or_else(|error| panic!("{error}"));
             assert_eq!(enrollment.status, status);
             assert_eq!(enrollment.leaf_der, b"certificate");
@@ -375,9 +426,53 @@ mod tests {
             Duration::ZERO,
         );
         let error = CaClient::new(&base)
-            .enroll(b"csr", "fedcba9876543210fedcba9876543210")
+            .enroll(b"csr", "fedcba9876543210fedcba9876543210", &[], &[])
             .expect_err("error response must fail");
-        assert!(error.to_string().contains("unsupported_csr_profile"));
+        assert_eq!(
+            error.to_string(),
+            "Http: CA request failed with HTTP 422: unsupported_csr_profile: request rejected"
+        );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn enrollment_explains_exact_san_authorization_and_retry() {
+        let body = br#"{"schema_version":1,"error":{"code":"san_not_authorized","message":"one or more requested SANs are not authorized"}}"#;
+        let (base, server) = one_response(
+            403,
+            &[("Content-Type", "application/json")],
+            body,
+            Duration::ZERO,
+        );
+        let error = CaClient::new(&base)
+            .enroll(
+                b"csr",
+                "fedcba9876543210fedcba9876543210",
+                &["server.demo".to_owned()],
+                &["192.0.2.20"
+                    .parse()
+                    .unwrap_or_else(|parse_error| panic!("{parse_error}"))],
+            )
+            .expect_err("unauthorized SAN response must fail");
+        assert_eq!(
+            error.to_string(),
+            concat!(
+                "Http: CA request failed with HTTP 403: san_not_authorized: ",
+                "one or more requested SANs are not authorized\n\n",
+                "SAN authorization guidance:\n",
+                "CA --listen controls only network binding; it does not authorize certificate ",
+                "names.\n",
+                "Every requested DNS/IP SAN must exactly match a CA --allow-dns/--allow-ip ",
+                "value; wildcards are not supported.\n",
+                "Requested DNS SANs (--allow-dns):\n",
+                "  - \"server.demo\"\n",
+                "Requested IP SANs (--allow-ip):\n",
+                "  - \"192.0.2.20\"\n",
+                "After restarting or reconfiguring the CA, retry with the existing AziHSM key, ",
+                "CSR, and idempotency key:\n",
+                "azihsm-ca-demo retry --output-dir <OUTPUT_DIR> --acknowledge-plain-http"
+            )
+        );
         let _ = server.join();
     }
 
