@@ -6,6 +6,8 @@ For implementation details and the full state model, see the
 [crate README](../crates/azihsm-ca/README.md).
 For the supported enrollment demonstration, which keeps the TLS key in the
 AziHSM provider, use the [`azihsm-ca-demo` guide](azihsm-ca-demo.md).
+For the complete TLS 1.3 framed server, use the
+[`azihsm-tls-server` guide](azihsm-tls-server.md).
 
 ## Security and cryptographic boundary
 

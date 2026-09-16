@@ -4,7 +4,9 @@ use crate::model::{CaError, CaMetadata, ReadyResponse};
 use crate::transcript::{self, Body};
 use crate::{Error, ErrorClass, Result};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use transcript::TranscriptSink;
 
 const JSON_LIMIT: usize = 64 * 1024;
 const CERT_LIMIT: usize = 256 * 1024;
@@ -17,17 +19,56 @@ pub struct Enrollment {
     pub leaf_der: Vec<u8>,
 }
 
+/// CA operation associated with a typed boundary failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaOperation {
+    Readiness,
+    Metadata,
+    Root,
+    Enrollment,
+}
+
+/// Stable startup-policy classification for CA failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaFailureKind {
+    Availability,
+    Protocol,
+}
+
+/// A classified CA failure preserving the bounded public error.
+#[derive(Debug)]
+pub struct CaFailure {
+    pub kind: CaFailureKind,
+    pub operation: CaOperation,
+    pub source: Error,
+}
+
 pub struct CaClient {
     base: String,
     agent: ureq::Agent,
+    transcript: Arc<dyn TranscriptSink>,
 }
 
 impl CaClient {
     pub fn new(base: &str) -> Self {
-        Self::with_timeouts(base, Duration::from_secs(3), Duration::from_secs(10))
+        Self::with_sink(base, transcript::default_sink())
     }
 
-    fn with_timeouts(base: &str, connect: Duration, global: Duration) -> Self {
+    pub fn with_sink(base: &str, transcript: Arc<dyn TranscriptSink>) -> Self {
+        Self::with_timeouts(
+            base,
+            Duration::from_secs(3),
+            Duration::from_secs(10),
+            transcript,
+        )
+    }
+
+    fn with_timeouts(
+        base: &str,
+        connect: Duration,
+        global: Duration,
+        transcript: Arc<dyn TranscriptSink>,
+    ) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .max_redirects(0)
             .http_status_as_error(false)
@@ -39,13 +80,24 @@ impl CaClient {
         Self {
             base: base.to_owned(),
             agent,
+            transcript,
         }
     }
 
     pub fn ready(&self) -> Result<()> {
-        tracing::info!(event = "readiness_check_started");
-        let (status, content_type, body) = self.get("/readyz", "application/json", JSON_LIMIT)?;
-        transcript::http_response(
+        self.ready_typed().map_err(|failure| failure.source)
+    }
+
+    pub fn ready_typed(&self) -> std::result::Result<(), CaFailure> {
+        let operation = CaOperation::Readiness;
+        crate::info_event(
+            "readiness_check_started",
+            "Checking whether the CA is ready to issue certificates.",
+        );
+        let (status, content_type, body) =
+            self.get_typed(operation, "/readyz", "application/json", JSON_LIMIT)?;
+        transcript::http_response_to(
+            self.transcript.as_ref(),
             "GET",
             "/readyz",
             status,
@@ -54,23 +106,51 @@ impl CaClient {
                 content_type.as_deref().unwrap_or("<missing>"),
             )],
             Body::Json(&body),
-        )?;
+        )
+        .map_err(|source| Self::protocol(operation, source))?;
         if status != 200 {
-            return Err(parse_ca_error(status, &body));
+            return Err(Self::status_failure(operation, status, &body));
         }
-        require_content_type(content_type.as_deref(), "application/json")?;
-        let response: ReadyResponse = parse_json(&body)?;
+        require_content_type(content_type.as_deref(), "application/json")
+            .map_err(|source| Self::protocol(operation, source))?;
+        let response: ReadyResponse =
+            parse_json(&body).map_err(|source| Self::protocol(operation, source))?;
         if response.schema_version != 1 || !response.ready {
-            return Err(http("CA readiness response was not ready"));
+            crate::warn_event(
+                "readiness_check_not_ready",
+                "The CA is not ready, so certificate issuance cannot safely continue.",
+            );
+            return Err(CaFailure {
+                kind: if response.schema_version == 1 {
+                    CaFailureKind::Availability
+                } else {
+                    CaFailureKind::Protocol
+                },
+                operation,
+                source: http("CA readiness response was not ready"),
+            });
         }
-        tracing::info!(event = "readiness_check_completed");
+        crate::info_event(
+            "readiness_check_completed",
+            "The CA reports that it is ready to issue certificates.",
+        );
         Ok(())
     }
 
     pub fn metadata(&self) -> Result<CaMetadata> {
-        tracing::info!(event = "ca_metadata_fetch_started");
-        let (status, content_type, body) = self.get("/v1/ca", "application/json", JSON_LIMIT)?;
-        transcript::http_response(
+        self.metadata_typed().map_err(|failure| failure.source)
+    }
+
+    pub fn metadata_typed(&self) -> std::result::Result<CaMetadata, CaFailure> {
+        let operation = CaOperation::Metadata;
+        crate::info_event(
+            "ca_metadata_fetch_started",
+            "Reading the CA authority identity and supported certificate endpoints.",
+        );
+        let (status, content_type, body) =
+            self.get_typed(operation, "/v1/ca", "application/json", JSON_LIMIT)?;
+        transcript::http_response_to(
+            self.transcript.as_ref(),
             "GET",
             "/v1/ca",
             status,
@@ -79,28 +159,51 @@ impl CaClient {
                 content_type.as_deref().unwrap_or("<missing>"),
             )],
             Body::Json(&body),
-        )?;
+        )
+        .map_err(|source| Self::protocol(operation, source))?;
         if status != 200 {
-            return Err(parse_ca_error(status, &body));
+            return Err(Self::status_failure(operation, status, &body));
         }
-        require_content_type(content_type.as_deref(), "application/json")?;
-        let metadata: CaMetadata = parse_json(&body)?;
+        require_content_type(content_type.as_deref(), "application/json")
+            .map_err(|source| Self::protocol(operation, source))?;
+        let metadata: CaMetadata =
+            parse_json(&body).map_err(|source| Self::protocol(operation, source))?;
         if metadata.schema_version != 1
             || metadata.root != "/v1/ca/root"
             || metadata.certificates != "/v1/certificates"
             || !is_lower_hex_32(&metadata.authority_id)
         {
-            return Err(http("CA metadata does not match the supported schema"));
+            return Err(Self::protocol(
+                operation,
+                http("CA metadata does not match the supported schema"),
+            ));
         }
-        tracing::info!(event = "ca_metadata_fetch_completed");
+        tracing::info!(
+            event = "ca_metadata_fetch_completed",
+            authority_id = metadata.authority_id,
+            message = "The CA authority identity and endpoints match the supported protocol."
+        );
         Ok(metadata)
     }
 
     pub fn root(&self) -> Result<Vec<u8>> {
-        tracing::info!(event = "root_fetch_started");
-        let (status, content_type, body) =
-            self.get("/v1/ca/root", "application/pkix-cert", CERT_LIMIT)?;
-        transcript::http_response(
+        self.root_typed().map_err(|failure| failure.source)
+    }
+
+    pub fn root_typed(&self) -> std::result::Result<Vec<u8>, CaFailure> {
+        let operation = CaOperation::Root;
+        crate::info_event(
+            "root_fetch_started",
+            "Fetching the public CA root for local verification and client trust provisioning.",
+        );
+        let (status, content_type, body) = self.get_typed(
+            operation,
+            "/v1/ca/root",
+            "application/pkix-cert",
+            CERT_LIMIT,
+        )?;
+        transcript::http_response_to(
+            self.transcript.as_ref(),
             "GET",
             "/v1/ca/root",
             status,
@@ -116,12 +219,17 @@ impl CaClient {
             } else {
                 Body::Json(&body)
             },
-        )?;
+        )
+        .map_err(|source| Self::protocol(operation, source))?;
         if status != 200 {
-            return Err(parse_ca_error(status, &body));
+            return Err(Self::status_failure(operation, status, &body));
         }
-        require_content_type(content_type.as_deref(), "application/pkix-cert")?;
-        tracing::info!(event = "root_fetch_completed");
+        require_content_type(content_type.as_deref(), "application/pkix-cert")
+            .map_err(|source| Self::protocol(operation, source))?;
+        crate::info_event(
+            "root_fetch_completed",
+            "The public CA root was fetched for verification and independent client trust.",
+        );
         Ok(body)
     }
 
@@ -131,10 +239,28 @@ impl CaClient {
         idempotency_key: &str,
         dns_sans: &[String],
         ip_sans: &[IpAddr],
+        recovery_guidance: &str,
     ) -> Result<Enrollment> {
-        tracing::info!(event = "enrollment_started");
+        self.enroll_typed(csr, idempotency_key, dns_sans, ip_sans, recovery_guidance)
+            .map_err(|failure| failure.source)
+    }
+
+    pub fn enroll_typed(
+        &self,
+        csr: &[u8],
+        idempotency_key: &str,
+        dns_sans: &[String],
+        ip_sans: &[IpAddr],
+        recovery_guidance: &str,
+    ) -> std::result::Result<Enrollment, CaFailure> {
+        let operation = CaOperation::Enrollment;
+        crate::info_event(
+            "enrollment_started",
+            "Submitting the public CSR, which proves key possession without sending the private key; the idempotency key makes retries replay-safe.",
+        );
         let url = self.url("/v1/certificates");
-        transcript::http_request(
+        transcript::http_request_to(
+            self.transcript.as_ref(),
             "POST",
             "/v1/certificates",
             &[
@@ -146,7 +272,8 @@ impl CaClient {
                 tag: "CERTIFICATE REQUEST",
                 bytes: csr,
             }),
-        )?;
+        )
+        .map_err(|source| Self::protocol(operation, source))?;
         let mut response = self
             .agent
             .post(&url)
@@ -154,7 +281,9 @@ impl CaClient {
             .header("Accept", "application/pkix-cert")
             .header("Idempotency-Key", idempotency_key)
             .send(csr)
-            .map_err(|_| http("CA enrollment request failed"))?;
+            .map_err(|error| {
+                Self::transport_failure(operation, error, "CA enrollment request failed")
+            })?;
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -172,8 +301,15 @@ impl CaClient {
             .with_config()
             .limit(CERT_LIMIT as u64)
             .read_to_vec()
-            .map_err(|_| http("CA enrollment response exceeded limits or could not be read"))?;
-        transcript::http_response(
+            .map_err(|error| {
+                Self::transport_failure(
+                    operation,
+                    error,
+                    "CA enrollment response exceeded limits or could not be read",
+                )
+            })?;
+        transcript::http_response_to(
+            self.transcript.as_ref(),
             "POST",
             "/v1/certificates",
             status,
@@ -199,15 +335,30 @@ impl CaClient {
             } else {
                 Body::Json(&body)
             },
-        )?;
+        )
+        .map_err(|source| Self::protocol(operation, source))?;
         if !matches!(status, 200 | 201) {
-            return Err(parse_enrollment_error(status, &body, dns_sans, ip_sans));
+            let mut failure = Self::status_failure(operation, status, &body);
+            if status < 500 {
+                failure.source =
+                    parse_enrollment_error(status, &body, dns_sans, ip_sans, recovery_guidance);
+            }
+            return Err(failure);
         }
-        require_content_type(content_type.as_deref(), "application/pkix-cert")?;
+        require_content_type(content_type.as_deref(), "application/pkix-cert")
+            .map_err(|source| Self::protocol(operation, source))?;
         if !is_lower_hex_32(&issuance_id) {
-            return Err(http("CA enrollment response omitted a valid issuance ID"));
+            return Err(Self::protocol(
+                operation,
+                http("CA enrollment response omitted a valid issuance ID"),
+            ));
         }
-        tracing::info!(event = "enrollment_completed", issuance_id);
+        let message = if status == 201 {
+            "The CA issued a new certificate for this CSR."
+        } else {
+            "The CA returned the byte-identical certificate from an idempotent retry."
+        };
+        tracing::info!(event = "enrollment_completed", issuance_id, status, message);
         Ok(Enrollment {
             status,
             issuance_id,
@@ -215,19 +366,27 @@ impl CaClient {
         })
     }
 
-    fn get(
+    fn get_typed(
         &self,
+        operation: CaOperation,
         path: &str,
         accept: &str,
         limit: usize,
-    ) -> Result<(u16, Option<String>, Vec<u8>)> {
-        transcript::http_request("GET", path, &[("Accept", accept)], None)?;
+    ) -> std::result::Result<(u16, Option<String>, Vec<u8>), CaFailure> {
+        transcript::http_request_to(
+            self.transcript.as_ref(),
+            "GET",
+            path,
+            &[("Accept", accept)],
+            None,
+        )
+        .map_err(|source| Self::protocol(operation, source))?;
         let mut response = self
             .agent
             .get(self.url(path))
             .header("Accept", accept)
             .call()
-            .map_err(|_| http("CA request failed"))?;
+            .map_err(|error| Self::transport_failure(operation, error, "CA request failed"))?;
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -239,8 +398,82 @@ impl CaClient {
             .with_config()
             .limit(limit as u64)
             .read_to_vec()
-            .map_err(|_| http("CA response exceeded limits or could not be read"))?;
+            .map_err(|error| {
+                Self::transport_failure(
+                    operation,
+                    error,
+                    "CA response exceeded limits or could not be read",
+                )
+            })?;
         Ok((status, content_type, body))
+    }
+
+    fn status_failure(operation: CaOperation, status: u16, body: &[u8]) -> CaFailure {
+        tracing::warn!(
+            event = "ca_request_failed",
+            status,
+            message = "The CA returned an unsuccessful status; the exact bounded response remains in the transcript."
+        );
+        CaFailure {
+            kind: if (500..=599).contains(&status) {
+                CaFailureKind::Availability
+            } else {
+                CaFailureKind::Protocol
+            },
+            operation,
+            source: parse_ca_error(status, body),
+        }
+    }
+
+    fn protocol(operation: CaOperation, source: Error) -> CaFailure {
+        crate::warn_event(
+            "ca_protocol_failed",
+            "The CA response did not match the bounded protocol contract, so the client fails closed.",
+        );
+        CaFailure {
+            kind: CaFailureKind::Protocol,
+            operation,
+            source,
+        }
+    }
+
+    fn transport_failure(
+        operation: CaOperation,
+        error: ureq::Error,
+        message: &'static str,
+    ) -> CaFailure {
+        let kind = match error {
+            ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::HostNotFound
+            | ureq::Error::ConnectionFailed => CaFailureKind::Availability,
+            ureq::Error::StatusCode(_)
+            | ureq::Error::Http(_)
+            | ureq::Error::BadUri(_)
+            | ureq::Error::Protocol(_)
+            | ureq::Error::RedirectFailed
+            | ureq::Error::InvalidProxyUrl
+            | ureq::Error::BodyExceedsLimit(_)
+            | ureq::Error::TooManyRedirects
+            | ureq::Error::Tls(_)
+            | ureq::Error::RequireHttpsOnly(_)
+            | ureq::Error::LargeResponseHeader(_, _)
+            | ureq::Error::ConnectProxyFailed(_)
+            | ureq::Error::TlsRequired
+            | ureq::Error::Other(_)
+            | ureq::Error::BodyStalled => CaFailureKind::Protocol,
+            _ => CaFailureKind::Protocol,
+        };
+        tracing::warn!(
+            event = "ca_transport_failed",
+            kind = ?kind,
+            message = "The CA exchange failed before a valid response was accepted; availability failures may use an already verified cache, while protocol failures fail closed."
+        );
+        CaFailure {
+            kind,
+            operation,
+            source: http(message),
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -285,6 +518,7 @@ fn parse_enrollment_error(
     body: &[u8],
     dns_sans: &[String],
     ip_sans: &[IpAddr],
+    recovery_guidance: &str,
 ) -> Error {
     let Ok(error) = serde_json::from_slice::<CaError>(body) else {
         return parse_ca_error(status, body);
@@ -316,11 +550,10 @@ fn parse_enrollment_error(
             message.push_str(&format!("\n  - \"{ip}\""));
         }
     }
-    message.push_str(
-        "\nAfter restarting or reconfiguring the CA, retry with the existing AziHSM key, CSR, \
-         and idempotency key:\n\
-         azihsm-ca-demo retry --output-dir <OUTPUT_DIR> --acknowledge-plain-http",
-    );
+    if !recovery_guidance.is_empty() {
+        message.push('\n');
+        message.push_str(recovery_guidance);
+    }
     Error::new(ErrorClass::Http, message)
 }
 
@@ -342,6 +575,8 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    const RECOVERY_GUIDANCE: &str = "After restarting or reconfiguring the CA, rerun the client.";
+
     #[test]
     fn nested_error_schema_is_required() {
         let error = parse_ca_error(
@@ -357,6 +592,42 @@ mod tests {
     }
 
     #[test]
+    fn typed_failure_classification_is_fail_closed() {
+        for error in [
+            ureq::Error::Io(std::io::Error::other("socket")),
+            ureq::Error::HostNotFound,
+            ureq::Error::ConnectionFailed,
+        ] {
+            assert_eq!(
+                CaClient::transport_failure(CaOperation::Readiness, error, "test").kind,
+                CaFailureKind::Availability
+            );
+        }
+        for error in [
+            ureq::Error::RedirectFailed,
+            ureq::Error::TooManyRedirects,
+            ureq::Error::BodyExceedsLimit(1),
+            ureq::Error::LargeResponseHeader(1, 2),
+            ureq::Error::Other(Box::new(std::io::Error::other("unknown"))),
+        ] {
+            assert_eq!(
+                CaClient::transport_failure(CaOperation::Readiness, error, "test").kind,
+                CaFailureKind::Protocol
+            );
+        }
+        assert_eq!(
+            CaClient::status_failure(CaOperation::Metadata, 503, b"{}").kind,
+            CaFailureKind::Availability
+        );
+        for status in [199, 301, 400, 499, 600] {
+            assert_eq!(
+                CaClient::status_failure(CaOperation::Metadata, status, b"{}").kind,
+                CaFailureKind::Protocol
+            );
+        }
+    }
+
+    #[test]
     fn enrollment_accepts_201_and_200_with_exact_headers() {
         for status in [201, 200] {
             let (base, server) = one_response(
@@ -369,7 +640,13 @@ mod tests {
                 Duration::ZERO,
             );
             let enrollment = CaClient::new(&base)
-                .enroll(b"csr", "fedcba9876543210fedcba9876543210", &[], &[])
+                .enroll(
+                    b"csr",
+                    "fedcba9876543210fedcba9876543210",
+                    &[],
+                    &[],
+                    RECOVERY_GUIDANCE,
+                )
                 .unwrap_or_else(|error| panic!("{error}"));
             assert_eq!(enrollment.status, status);
             assert_eq!(enrollment.leaf_der, b"certificate");
@@ -409,9 +686,14 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(
-            CaClient::with_timeouts(&base, Duration::from_millis(20), Duration::from_millis(20))
-                .ready()
-                .is_err()
+            CaClient::with_timeouts(
+                &base,
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+                transcript::default_sink(),
+            )
+            .ready()
+            .is_err()
         );
         let _ = server.join();
     }
@@ -426,7 +708,13 @@ mod tests {
             Duration::ZERO,
         );
         let error = CaClient::new(&base)
-            .enroll(b"csr", "fedcba9876543210fedcba9876543210", &[], &[])
+            .enroll(
+                b"csr",
+                "fedcba9876543210fedcba9876543210",
+                &[],
+                &[],
+                RECOVERY_GUIDANCE,
+            )
             .expect_err("error response must fail");
         assert_eq!(
             error.to_string(),
@@ -452,6 +740,7 @@ mod tests {
                 &["192.0.2.20"
                     .parse()
                     .unwrap_or_else(|parse_error| panic!("{parse_error}"))],
+                RECOVERY_GUIDANCE,
             )
             .expect_err("unauthorized SAN response must fail");
         assert_eq!(
@@ -468,9 +757,7 @@ mod tests {
                 "  - \"server.demo\"\n",
                 "Requested IP SANs (--allow-ip):\n",
                 "  - \"192.0.2.20\"\n",
-                "After restarting or reconfiguring the CA, retry with the existing AziHSM key, ",
-                "CSR, and idempotency key:\n",
-                "azihsm-ca-demo retry --output-dir <OUTPUT_DIR> --acknowledge-plain-http"
+                "After restarting or reconfiguring the CA, rerun the client."
             )
         );
         let _ = server.join();

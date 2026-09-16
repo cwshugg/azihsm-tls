@@ -3,6 +3,7 @@
 use crate::handles::{NcryptKey, NcryptProvider};
 use crate::{Error, ErrorClass, Result, hash_sha256, public_point, random, verify_p256_sha256};
 use std::ptr::{null, null_mut};
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::NTE_BAD_KEYSET;
@@ -107,6 +108,53 @@ pub struct AzihsmKey {
     key: NcryptKey,
 }
 
+/// Owns one provider and one named key for the full signing lifetime.
+///
+/// Field order is intentional: Rust drops `key` before `provider`.
+#[derive(Debug)]
+pub struct AzihsmSession {
+    key: Mutex<AzihsmKey>,
+    _provider: AzihsmProvider,
+}
+
+impl AzihsmSession {
+    /// Opens an existing current-user named key and keeps its provider alive.
+    pub fn open(provider_name: &str, key_name: &str) -> Result<Self> {
+        let provider = AzihsmProvider::open_named(provider_name)?;
+        let key = provider.open_key(key_name).map_err(|status| {
+            status_error(ErrorClass::Provider, "NCryptOpenKey(session)", status)
+        })?;
+        Ok(Self {
+            key: Mutex::new(key),
+            _provider: provider,
+        })
+    }
+
+    /// Runs the provider-backed key self-test.
+    pub fn kat(&self) -> Result<()> {
+        self.lock()?.kat()
+    }
+
+    /// Exports only the public P-256 blob.
+    pub fn public_blob(&self) -> Result<[u8; 72]> {
+        self.lock()?.public_blob()
+    }
+
+    /// Signs one SHA-256 digest for a production TLS CertificateVerify.
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
+        tracing::debug!(event = "certificate_verify_sign_started");
+        let signature = self.lock()?.sign(digest)?;
+        tracing::info!(event = "certificate_verify_sign_completed");
+        Ok(signature)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, AzihsmKey>> {
+        self.key
+            .lock()
+            .map_err(|_| Error::new(ErrorClass::Provider, "AziHSM key session mutex is poisoned"))
+    }
+}
+
 impl AzihsmKey {
     pub fn finalize(&self) -> i32 {
         // SAFETY: key is a live staged key. Zero flags prohibit overwrite.
@@ -160,7 +208,7 @@ impl AzihsmKey {
         Ok(blob)
     }
 
-    pub fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
+    pub(crate) fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
         let mut size = 0;
         let status = ncrypt_sign_hash(self.key.0, digest, None, &mut size);
         if status < 0 || size != 64 || size as usize > MAX_SIGNATURE {
@@ -253,6 +301,36 @@ fn wide_status(value: &str) -> std::result::Result<Vec<u16>, i32> {
 mod tests {
     use super::*;
     use rcgen::SigningKey;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn owned_session_field_order_drops_key_before_provider() {
+        #[derive(Debug)]
+        struct Marker(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                self.1
+                    .lock()
+                    .unwrap_or_else(|error| panic!("{error}"))
+                    .push(self.0);
+            }
+        }
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Session {
+            key: Marker,
+            provider: Marker,
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        drop(Session {
+            key: Marker("key", Arc::clone(&order)),
+            provider: Marker("provider", Arc::clone(&order)),
+        });
+        assert_eq!(
+            *order.lock().unwrap_or_else(|error| panic!("{error}")),
+            ["key", "provider"]
+        );
+    }
 
     #[test]
     #[ignore = "requires registered named AziHSM test provider"]

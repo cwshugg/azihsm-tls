@@ -1,4 +1,4 @@
-//! Reparse-safe, non-overwriting artifact publication.
+//! Reparse-safe, non-overwriting artifact publication shared by client applications.
 
 use crate::{Error, ErrorClass, Result};
 use serde::{Serialize, de::DeserializeOwned};
@@ -44,10 +44,15 @@ pub fn validate_output_dir(path: &Path) -> Result<()> {
 }
 
 pub fn is_empty(path: &Path) -> Result<bool> {
-    Ok(fs::read_dir(path)
+    for entry in fs::read_dir(path)
         .map_err(|error| state(format!("cannot list output directory: {error}")))?
-        .next()
-        .is_none())
+    {
+        let entry = entry.map_err(|error| state(format!("cannot inspect output: {error}")))?;
+        if entry.file_name() != crate::state_lock::STATE_LOCK_FILE {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -262,7 +267,7 @@ mod tests {
         let directory = std::env::current_dir()
             .unwrap_or_else(|error| panic!("{error}"))
             .join("target")
-            .join(format!("demo-files-{}", std::process::id()));
+            .join(format!("client-files-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(
             directory

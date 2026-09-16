@@ -21,7 +21,31 @@ pub fn verify_chain(
     dns: &[String],
     ips: &[IpAddr],
 ) -> Result<()> {
-    tracing::info!(event = "certificate_verification_started");
+    verify_chain_inner(root_der, leaf_der, expected_spki, dns, ips, true)
+}
+
+pub fn verify_chain_profile(
+    root_der: &[u8],
+    leaf_der: &[u8],
+    expected_spki: &[u8],
+    dns: &[String],
+    ips: &[IpAddr],
+) -> Result<()> {
+    verify_chain_inner(root_der, leaf_der, expected_spki, dns, ips, false)
+}
+
+fn verify_chain_inner(
+    root_der: &[u8],
+    leaf_der: &[u8],
+    expected_spki: &[u8],
+    dns: &[String],
+    ips: &[IpAddr],
+    check_current_time: bool,
+) -> Result<()> {
+    crate::info_event(
+        "certificate_verification_started",
+        "Verifying root and leaf signatures, profile, validity, SANs, and the leaf public key against the AziHSM key.",
+    );
     let root = parse(root_der, "root")?;
     let leaf = parse(leaf_der, "leaf")?;
     validate_p256_sha256(&root, "root")?;
@@ -39,14 +63,17 @@ pub fn verify_chain(
         ],
         "leaf",
     )?;
-    validate_root_profile(&root)?;
+    validate_root_profile(&root, check_current_time)?;
     root.verify_signature(None)
         .map_err(|_| validation("root self-signature is invalid"))?;
-    validate_leaf_profile(&leaf, &root, expected_spki)?;
+    validate_leaf_profile(&leaf, &root, expected_spki, check_current_time)?;
     leaf.verify_signature(Some(&root.tbs_certificate.subject_pki))
         .map_err(|_| validation("leaf certificate signature is invalid"))?;
     verify_sans(&leaf, dns, ips)?;
-    tracing::info!(event = "certificate_verification_completed");
+    crate::info_event(
+        "certificate_verification_completed",
+        "Certificate verification succeeded, so the leaf belongs to the requested AziHSM key and identity.",
+    );
     Ok(())
 }
 
@@ -68,14 +95,14 @@ fn require_extension_set(
     }
 }
 
-fn validate_root_profile(root: &X509Certificate<'_>) -> Result<()> {
+fn validate_root_profile(root: &X509Certificate<'_>, check_current_time: bool) -> Result<()> {
     if root.tbs_certificate.subject != root.tbs_certificate.issuer {
         return Err(validation("root issuer does not equal root subject"));
     }
     if !exact_common_name(&root.tbs_certificate.subject, ROOT_CN) {
         return Err(validation("root subject is invalid"));
     }
-    if !root.validity().is_valid() {
+    if check_current_time && !root.validity().is_valid() {
         return Err(validation("root validity is invalid"));
     }
     let basic = extension(root, "2.5.29.19")?;
@@ -119,6 +146,7 @@ fn validate_leaf_profile(
     leaf: &X509Certificate<'_>,
     root: &X509Certificate<'_>,
     expected_spki: &[u8],
+    check_current_time: bool,
 ) -> Result<()> {
     if leaf.tbs_certificate.issuer != root.tbs_certificate.subject {
         return Err(validation("leaf issuer does not match root subject"));
@@ -126,7 +154,7 @@ fn validate_leaf_profile(
     if leaf.tbs_certificate.subject.iter_rdn().next().is_some() {
         return Err(validation("leaf subject is invalid"));
     }
-    if !leaf.validity().is_valid() {
+    if check_current_time && !leaf.validity().is_valid() {
         return Err(validation("leaf validity is invalid"));
     }
     if leaf.tbs_certificate.subject_pki.raw != expected_spki {

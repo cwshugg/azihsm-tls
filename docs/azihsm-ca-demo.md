@@ -1,5 +1,10 @@
 # AziHSM CA Enrollment Demo Guide
 
+`azihsm-ca-demo` is a standalone application. It shares neutral CA protocol,
+transcript, CSR, and certificate-verification primitives through
+`azihsm-ca-client`, but it does not depend on `azihsm-tls-server` or share the
+server application's state. Guide
+
 This guide operates the Windows-only `azihsm-ca-demo` client against the
 repository's demonstration CA. For CA setup and API details, see the
 [CA server operator guide](ca-server-usage.md).
@@ -119,6 +124,11 @@ subject CN, SANs, CSR/SPKI hashes, authority and issuance IDs, certificate
 hashes, verification time, and deletion status. It does not open or print a
 private key.
 
+Every command holds the shared `.azihsm-state.lock` for its complete
+operation. If `azihsm-tls-server` is using the same state directory, create,
+retry, show, and delete fail closed until the server has drained and released
+the lock.
+
 ## Delete the Key
 
 Copy the exact key name from `show`:
@@ -225,8 +235,19 @@ default. `RUST_LOG` accepts exactly `off`, `error`, `warn`, `info`, `debug`, or
 `trace`. Invalid values exit with code `2`; module filters and comma-separated
 directives are unsupported.
 
-Tracing reports bounded lifecycle events. The transcript—not tracing—is the
-deliberately verbose record of public request, response, and local metadata.
+Tracing reports a stable `event` field plus a concise `message` for people
+watching the demo. The transcript—not tracing—is the deliberately verbose,
+byte-compatible record of public request, response, and local metadata:
+
+```text
+INFO event="readiness_check_started" message="Checking whether the CA is ready to issue certificates."
+=== HTTP RESPONSE ===
+Method: GET
+Path: /readyz
+Body (JSON):
+{ ... exact public JSON ... }
+=== END HTTP RESPONSE ===
+```
 
 ## Verification
 

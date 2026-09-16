@@ -1,11 +1,9 @@
 //! Rcgen certificate construction and x509-parser inspection.
 
-pub mod signer;
-
 use crate::crypto::{hash_sha1, public_point};
 use crate::error::{Error, ErrorClass, Result};
 use crate::policy::CLOCK_SKEW_SECONDS;
-use crate::win::ncrypt::AzihsmKey;
+use azihsm_ncrypt::{AzihsmKey, AzihsmSigningKey, PublicP256Key};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyIdMethod, KeyUsagePurpose, SanType, SerialNumber,
@@ -14,8 +12,6 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use x509_parser::prelude::{FromDer, X509Certificate};
-
-use signer::{AzihsmSigningKey, PublicP256Key};
 
 #[derive(Debug, Clone)]
 pub struct CertificateBacking {

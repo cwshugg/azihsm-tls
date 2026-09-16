@@ -1,0 +1,38 @@
+[package]
+name = "azihsm-tls-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "TLS 1.3 framed echo server using a persistent AziHSM key"
+repository = "https://github.com/cwshugg/azihsm-tls"
+
+[dependencies]
+azihsm-ca-client = { path = "../azihsm-ca-client" }
+azihsm-ncrypt = { path = "../azihsm-ncrypt" }
+base64 = "=0.22.1"
+clap = { version = "=4.6.7", default-features = false, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+time = { version = "=0.3.55", default-features = false, features = ["std"] }
+tokio = { version = "=1.53.1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-rustls = { version = "=0.26.5", default-features = false }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
