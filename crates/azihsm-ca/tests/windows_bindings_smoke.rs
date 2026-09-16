@@ -8,8 +8,7 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
 use windows_sys::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCryptVerifySignature, CertCreateCertificateContext, CryptEncodeObjectEx,
-    CryptSignAndEncodeCertificate, CryptVerifyCertificateSignatureEx, NCryptCreatePersistedKey,
+    CertCreateCertificateContext, CryptVerifyCertificateSignatureEx, NCryptCreatePersistedKey,
     NCryptFinalizeKey, NCryptOpenKey, NCryptOpenStorageProvider, NCryptSignHash,
 };
 use windows_sys::Win32::Security::{GetFileSecurityW, GetTokenInformation};
@@ -17,7 +16,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FlushFileBuffers, LockFileEx, ReadDirectoryChangesW,
     UnlockFileEx,
 };
-use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
 use windows_sys::Win32::System::Threading::{
     CreateEventW, OpenProcessToken, ResetEvent, WaitForSingleObject,
@@ -27,11 +25,7 @@ use windows_sys::Win32::System::Threading::{
 fn used_windows_bindings_are_available() {
     let _: unsafe extern "system" fn(HANDLE) -> i32 = CloseHandle;
     let _ = FlushFileBuffers;
-    let _ = BCryptGenRandom;
-    let _ = BCryptVerifySignature;
     let _ = CertCreateCertificateContext;
-    let _ = CryptSignAndEncodeCertificate;
-    let _ = CryptEncodeObjectEx;
     let _ = CryptVerifyCertificateSignatureEx;
     let _ = NCryptCreatePersistedKey;
     let _ = NCryptFinalizeKey;
@@ -54,5 +48,4 @@ fn used_windows_bindings_are_available() {
     let _ = OpenProcessToken;
     let _ = ResetEvent;
     let _ = WaitForSingleObject;
-    let _ = SetConsoleCtrlHandler;
 }

@@ -26,6 +26,8 @@ time = { version = "=0.3.55", default-features = false, features = [
     "parsing",
 ] }
 tokio = { version = "=1.53.1", default-features = false, features = ["sync", "time"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
 x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
 
 [target.'cfg(windows)'.dependencies]

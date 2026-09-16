@@ -226,6 +226,21 @@ Unknown `GET` and `POST` targets use the certificate-not-found `404` shape;
 every other method uses the versioned `method_not_allowed` `405` shape,
 including unknown targets.
 
+## Logging
+
+`serve` writes compact human-readable logs exclusively to standard output at
+`info` level by default. Logs have no timestamp, target, or ANSI escapes.
+Set `RUST_LOG` to exactly one global level: `off`, `error`, `warn`, `info`,
+`debug`, or `trace`. Other values, including module directives, fail with exit
+code `2`. There is no logging CLI option.
+
+Offline commands preserve their existing output unless `RUST_LOG` is
+explicitly set. Logged fields are limited to stable event/reason codes,
+non-sensitive limits and counts, authority/issuance identifiers, and public
+NCrypt status values. Logs never include paths, SIDs, source addresses, SANs,
+request or certificate bodies, public keys, key names or handles,
+idempotency material, or private material.
+
 Leaf validity is capped at the persisted root certificate's `notAfter`.
 Enrollment fails closed when the root has expired or no positive validity
 interval remains. Status reports only the currently loaded record and stored

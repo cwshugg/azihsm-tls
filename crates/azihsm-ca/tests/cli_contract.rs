@@ -28,3 +28,24 @@ fn invalid_command_returns_usage() {
         .unwrap_or_else(|error| panic!("command failed: {error}"));
     assert_eq!(status.code(), Some(2));
 }
+
+#[test]
+fn invalid_rust_log_is_rejected_without_broad_directive_parsing() {
+    let output = Command::new(EXE)
+        .args([
+            "serve",
+            "--state-dir",
+            r"C:\nonexistent",
+            "--allow-dns",
+            "server.example",
+        ])
+        .env("RUST_LOG", "info,azihsm_ca=trace")
+        .output()
+        .unwrap_or_else(|error| panic!("command failed: {error}"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("RUST_LOG must be one of off, error, warn, info, debug, or trace")
+    );
+    assert!(output.stdout.is_empty());
+}

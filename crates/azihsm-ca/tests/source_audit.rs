@@ -53,6 +53,31 @@ fn product_has_no_prohibited_dependencies_or_fault_controls() {
         assert!(!source.contains(prohibited), "found {prohibited}");
     }
     assert!(!manifest.contains("futures-util ="));
+    assert!(manifest.contains(
+        "tracing = { version = \"=0.1.44\", default-features = false, features = [\"std\"] }"
+    ));
+    assert!(manifest.contains(
+        "tracing-subscriber = { version = \"=0.3.23\", default-features = false, features = [\"fmt\", \"std\"] }"
+    ));
+    assert!(!source.contains("EnvFilter"));
+    for event in [
+        "server_starting",
+        "state_format_validated",
+        "authority_opened",
+        "recovery_completed",
+        "readiness_changed",
+        "watcher_failed",
+        "watcher_replaced",
+        "enrollment_accepted",
+        "enrollment_replayed",
+        "enrollment_denied",
+        "request_rejected",
+        "ncrypt_operation_failed",
+        "server_shutdown_started",
+        "server_shutdown_completed",
+    ] {
+        assert!(source.contains(event), "missing logging event {event}");
+    }
     assert_eq!(
         source.matches("NCryptSignHash(").count(),
         1,

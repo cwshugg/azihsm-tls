@@ -1,6 +1,7 @@
 //! Persistent schemas, path validation, exclusive locking, and durable publication.
 
 use crate::crypto::hash_sha256;
+use crate::encoding::canonical_json;
 use crate::error::{Error, ErrorClass, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fs::{self, File, OpenOptions};
@@ -993,9 +994,7 @@ impl Drop for OwnedHandle {
 }
 
 pub fn durable_json<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec(value)
-        .map_err(|error| state_error(format!("JSON encoding failed: {error}")))?;
-    bytes.push(b'\n');
+    let bytes = canonical_json(value, "JSON")?;
     durable_bytes(path, &bytes)?;
     Ok(bytes)
 }

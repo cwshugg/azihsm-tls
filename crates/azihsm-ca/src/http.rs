@@ -3,6 +3,7 @@
 use crate::authority::{LoadedAuthority, certificate_bytes, certificate_status, issue};
 use crate::cli::ServeArgs;
 use crate::csr::parse_and_authorize;
+use crate::encoding::is_lower_hex_32;
 use crate::error::{Error, ErrorClass, Result};
 use crate::policy::warning_text;
 use crate::state::{DirectoryWatcher, WatchResult};
@@ -17,6 +18,7 @@ use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::net::{IpAddr, Shutdown, TcpStream};
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,18 +71,22 @@ impl FromRequest for Pkcs10Request {
             match tokio::time::timeout_at(deadline, payload.to_bytes_limited(REQUEST_LIMIT)).await {
                 Err(_) => Err(actix_web::error::InternalError::from_response(
                     "busy",
-                    json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+                    request_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "deadline"),
                 )
                 .into()),
                 Ok(Ok(Ok(bytes))) => Ok(Self(bytes)),
                 Ok(Err(_)) => Err(actix_web::error::InternalError::from_response(
                     "request_too_large",
-                    json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+                    request_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_too_large",
+                        "malformed",
+                    ),
                 )
                 .into()),
                 Ok(Ok(Err(_))) => Err(actix_web::error::InternalError::from_response(
                     "malformed_request",
-                    json_error(StatusCode::BAD_REQUEST, "malformed_request"),
+                    request_error(StatusCode::BAD_REQUEST, "malformed_request", "malformed"),
                 )
                 .into()),
             }
@@ -154,6 +160,10 @@ pub fn serve(args: ServeArgs, loaded: LoadedAuthority) -> Result<()> {
         .client_disconnect_timeout(Duration::from_secs(2))
         .keep_alive(KeepAlive::Disabled)
         .shutdown_timeout(10)
+        .shutdown_signal(async {
+            let _ = actix_web::rt::signal::ctrl_c().await;
+            tracing::info!(event = "server_shutdown_started");
+        })
         .on_connect(|io, extensions| {
             register_connection_deadline(io, extensions, REQUEST_LIFETIME);
         })
@@ -163,8 +173,20 @@ pub fn serve(args: ServeArgs, loaded: LoadedAuthority) -> Result<()> {
         .await
         .map_err(|error| Error::new(ErrorClass::Http, format!("HTTP server failed: {error}")))
     });
-    watcher.stop_and_join()?;
-    result
+    finish_server_lifecycle(result, || watcher.stop_and_join())
+}
+
+fn finish_server_lifecycle<F>(server_result: Result<()>, stop_watcher: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if let Err(error) = server_result {
+        let _ = stop_watcher();
+        return Err(error);
+    }
+    stop_watcher()?;
+    tracing::info!(event = "server_shutdown_completed");
+    Ok(())
 }
 
 fn api_scope() -> actix_web::Scope {
@@ -269,11 +291,19 @@ async fn protocol_middleware(
         || request.headers().contains_key(header::TRAILER);
     let response = if Instant::now() >= deadline {
         request
-            .into_response(json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"))
+            .into_response(request_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "deadline",
+            ))
             .map_into_boxed_body()
     } else if malformed {
         request
-            .into_response(json_error(StatusCode::BAD_REQUEST, "malformed_request"))
+            .into_response(request_error(
+                StatusCode::BAD_REQUEST,
+                "malformed_request",
+                "malformed",
+            ))
             .map_into_boxed_body()
     } else {
         match tokio::time::timeout_at(
@@ -286,7 +316,7 @@ async fn protocol_middleware(
             Err(_) => {
                 return Err(actix_web::error::InternalError::from_response(
                     "busy",
-                    json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+                    request_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "deadline"),
                 )
                 .into());
             }
@@ -313,13 +343,13 @@ fn readiness_response(ready: bool) -> HttpResponse {
     if ready {
         HttpResponse::Ok().json(serde_json::json!({"schema_version":1,"ready":true}))
     } else {
-        json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready")
+        request_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready", "unready")
     }
 }
 
 async fn metadata(state: web::Data<AppState>) -> HttpResponse {
     if !is_ready(&state) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+        return request_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready", "unready");
     }
     metadata_response(&state.authority.authority.authority_id)
 }
@@ -335,7 +365,7 @@ fn metadata_response(authority_id: &str) -> HttpResponse {
 
 async fn root(state: web::Data<AppState>) -> HttpResponse {
     if !is_ready(&state) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+        return request_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready", "unready");
     }
     HttpResponse::Ok()
         .content_type("application/pkix-cert")
@@ -352,16 +382,16 @@ async fn enroll(
         |value| value.processing,
     );
     if Instant::now() >= deadline {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy");
+        return request_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "deadline");
     }
     if !is_ready(&state) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+        return request_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready", "unready");
     }
     if request.version() != actix_web::http::Version::HTTP_11
         || request.headers().contains_key(header::TRANSFER_ENCODING)
         || request.headers().contains_key(header::EXPECT)
     {
-        return json_error(StatusCode::BAD_REQUEST, "malformed_request");
+        return request_error(StatusCode::BAD_REQUEST, "malformed_request", "malformed");
     }
     if request
         .headers()
@@ -369,20 +399,30 @@ async fn enroll(
         .and_then(|v| v.to_str().ok())
         != Some("application/pkcs10")
     {
-        return json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type");
+        return request_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "malformed",
+        );
     }
     let idempotency = match request
         .headers()
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())
     {
-        Some(value) if valid_hex32(value) => value.to_owned(),
-        _ => return json_error(StatusCode::BAD_REQUEST, "invalid_idempotency_key"),
+        Some(value) if is_lower_hex_32(value) => value.to_owned(),
+        _ => {
+            return request_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_idempotency_key",
+                "malformed",
+            );
+        }
     };
     let body = body.0;
     let source = match request.peer_addr().map(|address| address.ip()) {
         Some(source) => source,
-        None => return json_error(StatusCode::BAD_REQUEST, "malformed_request"),
+        None => return request_error(StatusCode::BAD_REQUEST, "malformed_request", "malformed"),
     };
     if !state
         .limiter
@@ -390,22 +430,26 @@ async fn enroll(
         .ok()
         .is_some_and(|mut limiter| limiter.allow(source))
     {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        return request_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "rate");
     }
     let admission = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+        Err(_) => {
+            return request_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "admission");
+        }
     };
     let blocking = match Arc::clone(&state.blocking).try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+        Err(_) => {
+            return request_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "admission");
+        }
     };
     let parsed = match parse_and_authorize(&body, &state.policy) {
         Ok(parsed) => parsed,
         Err(error) => return mapped_error(&error),
     };
     if Instant::now() >= deadline {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy");
+        return request_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "deadline");
     }
     let authority = Arc::clone(&state.authority);
     let policy = state.policy.clone();
@@ -422,20 +466,28 @@ async fn enroll(
         issue(&authority, &policy, &parsed, &body, &idempotency, &source)
     });
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), job).await {
-        Ok(Ok(Ok(issued))) => HttpResponse::build(
-            StatusCode::from_u16(issued.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        )
-        .insert_header(("X-AziHSM-Issuance-Id", issued.issuance_id))
-        .content_type("application/pkix-cert")
-        .body(issued.certificate),
+        Ok(Ok(Ok(issued))) => {
+            let event = if issued.status == 200 {
+                "enrollment_replayed"
+            } else {
+                "enrollment_accepted"
+            };
+            tracing::info!(event, issuance_id = issued.issuance_id);
+            HttpResponse::build(
+                StatusCode::from_u16(issued.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            )
+            .insert_header(("X-AziHSM-Issuance-Id", issued.issuance_id))
+            .content_type("application/pkix-cert")
+            .body(issued.certificate)
+        }
         Ok(Ok(Err(error))) => mapped_error(&error),
-        _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "busy"),
+        _ => request_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "deadline"),
     }
 }
 
 async fn certificate(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
     if !is_ready(&state) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+        return request_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready", "unready");
     }
     match certificate_bytes(&state.authority.state_dir, &path) {
         Ok(Some(bytes)) => HttpResponse::Ok()
@@ -447,7 +499,7 @@ async fn certificate(path: web::Path<String>, state: web::Data<AppState>) -> Htt
 
 async fn status(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
     if !is_ready(&state) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready");
+        return request_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready", "unready");
     }
     match certificate_status(&state.authority.state_dir, &path) {
         Ok(Some(status)) => status_response(status),
@@ -492,6 +544,11 @@ fn json_error(status: StatusCode, code: &'static str) -> HttpResponse {
     json_error_with_message(status, code, "request rejected")
 }
 
+fn request_error(status: StatusCode, code: &'static str, reason: &'static str) -> HttpResponse {
+    tracing::warn!(event = "request_rejected", reason);
+    json_error(status, code)
+}
+
 fn json_error_with_message(
     status: StatusCode,
     code: &'static str,
@@ -505,28 +562,23 @@ fn json_error_with_message(
 
 fn mapped_error(error: &Error) -> HttpResponse {
     let text = error.to_string();
-    if text.contains("san_not_allowed") {
-        json_error(StatusCode::FORBIDDEN, "san_not_authorized")
+    let (status, reason) = if text.contains("san_not_allowed") {
+        (StatusCode::FORBIDDEN, "san_not_authorized")
     } else if text.contains("idempotency_conflict") {
-        json_error(StatusCode::CONFLICT, "idempotency_conflict")
+        (StatusCode::CONFLICT, "idempotency_conflict")
     } else if text.contains("san_required") {
-        json_error(StatusCode::UNPROCESSABLE_ENTITY, "san_required")
+        (StatusCode::UNPROCESSABLE_ENTITY, "san_required")
     } else if text.contains("unsupported_csr_profile") {
-        json_error(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_csr_profile")
+        (StatusCode::UNPROCESSABLE_ENTITY, "unsupported_csr_profile")
     } else if text.contains("malformed_subject") {
-        json_error(StatusCode::BAD_REQUEST, "malformed_subject")
+        (StatusCode::BAD_REQUEST, "malformed_subject")
     } else if text.contains("malformed_csr") {
-        json_error(StatusCode::BAD_REQUEST, "malformed_csr")
+        (StatusCode::BAD_REQUEST, "malformed_csr")
     } else {
-        json_error(StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready")
-    }
-}
-
-fn valid_hex32(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        (StatusCode::SERVICE_UNAVAILABLE, "ca_not_ready")
+    };
+    tracing::warn!(event = "enrollment_denied", reason);
+    json_error(status, reason)
 }
 
 struct InFlightGuard(Arc<AtomicUsize>);
@@ -591,7 +643,9 @@ impl ReadinessWatcher {
         ready: Arc<AtomicBool>,
         pending: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let mut watcher = DirectoryWatcher::register(&authority.state_dir)?;
+        let mut watcher = DirectoryWatcher::register(&authority.state_dir).inspect_err(|_| {
+            tracing::warn!(event = "watcher_failed", reason = "initial_registration");
+        })?;
         let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if stop_event.is_null() {
             return Err(Error::new(
@@ -603,6 +657,7 @@ impl ReadinessWatcher {
         let handle = thread::spawn(move || {
             let stop_event = stop_value as HANDLE;
             let mut initial = true;
+            let mut recovery_logged = false;
             loop {
                 let event = if initial {
                     initial = false;
@@ -614,28 +669,68 @@ impl ReadinessWatcher {
                     }
                 };
                 pending.store(true, Ordering::Release);
-                ready.store(false, Ordering::Release);
-                if event.is_err() || matches!(event, Ok(Some(WatchResult::Overflow))) {
-                    match DirectoryWatcher::register_replacement(&authority.state_dir) {
-                        Ok(replacement) => watcher = replacement,
-                        Err(_) => continue,
-                    }
+                let reason = match &event {
+                    Err(_) => "wait_failed",
+                    Ok(Some(WatchResult::Overflow)) => "overflow",
+                    Ok(Some(WatchResult::Changed)) => "state_change",
+                    Ok(Some(WatchResult::Timeout)) | Ok(None) => "periodic_validation",
+                };
+                set_readiness(&ready, false, reason);
+                if (event.is_err() || matches!(event, Ok(Some(WatchResult::Overflow))))
+                    && !replace_watcher(
+                        &mut watcher,
+                        &authority.state_dir,
+                        if event.is_err() {
+                            "wait_failed"
+                        } else {
+                            "overflow"
+                        },
+                    )
+                {
+                    continue;
                 }
                 if let Ok(_guard) = issuance.lock() {
                     loop {
                         if crate::authority::revalidate(&authority).is_err() {
+                            set_readiness(&ready, false, "state_invalid");
                             break;
                         }
                         match watcher.wait(Duration::ZERO) {
                             Ok(WatchResult::Timeout) => {
                                 pending.store(false, Ordering::Release);
-                                ready.store(true, Ordering::Release);
+                                set_readiness(&ready, true, "state_validated");
+                                if !recovery_logged
+                                    && let Ok((issuances, reservations, audits)) =
+                                        crate::authority::recovery_counts(&authority.state_dir)
+                                {
+                                    tracing::info!(
+                                        event = "recovery_completed",
+                                        authority_id = authority.authority.authority_id,
+                                        completed_issuances = issuances,
+                                        serial_reservations = reservations,
+                                        audit_records = audits
+                                    );
+                                    recovery_logged = true;
+                                }
                                 break;
                             }
-                            Ok(_) | Err(_) => {
-                                match DirectoryWatcher::register_replacement(&authority.state_dir) {
-                                    Ok(replacement) => watcher = replacement,
-                                    Err(_) => break,
+                            Ok(WatchResult::Changed) => continue,
+                            Ok(WatchResult::Overflow) => {
+                                if !replace_watcher(
+                                    &mut watcher,
+                                    &authority.state_dir,
+                                    "drain_overflow",
+                                ) {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                if !replace_watcher(
+                                    &mut watcher,
+                                    &authority.state_dir,
+                                    "drain_failed",
+                                ) {
+                                    break;
                                 }
                             }
                         }
@@ -660,6 +755,34 @@ impl ReadinessWatcher {
         unsafe { CloseHandle(self.stop_event) };
         result
     }
+}
+
+fn set_readiness(ready: &AtomicBool, value: bool, reason: &'static str) -> bool {
+    if ready.swap(value, Ordering::AcqRel) == value {
+        return false;
+    }
+    tracing::info!(event = "readiness_changed", ready = value, reason);
+    true
+}
+
+fn replace_watcher(watcher: &mut DirectoryWatcher, state_dir: &Path, reason: &'static str) -> bool {
+    let Some(replacement) = attempt_watcher_replacement(reason, || {
+        DirectoryWatcher::register_replacement(state_dir).ok()
+    }) else {
+        return false;
+    };
+    *watcher = replacement;
+    true
+}
+
+fn attempt_watcher_replacement<T, F>(reason: &'static str, register: F) -> Option<T>
+where
+    F: FnOnce() -> Option<T>,
+{
+    tracing::warn!(event = "watcher_failed", reason);
+    let replacement = register()?;
+    tracing::info!(event = "watcher_replaced", reason);
+    Some(replacement)
 }
 
 struct RateLimiter {
@@ -717,6 +840,130 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_events(action: impl FnOnce()) -> String {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(Capture(Arc::clone(&bytes)))
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .compact()
+            .finish();
+        tracing::subscriber::with_default(subscriber, action);
+        String::from_utf8(
+            bytes
+                .lock()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .clone(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn shutdown_events_describe_only_successful_graceful_shutdown() {
+        let output = capture_events(|| {
+            tracing::info!(event = "server_shutdown_started");
+            assert!(
+                finish_server_lifecycle(Ok(()), || {
+                    tracing::info!(event = "watcher_stopped");
+                    Ok(())
+                })
+                .is_ok()
+            );
+        });
+        let started = output
+            .find("event=\"server_shutdown_started\"")
+            .unwrap_or_else(|| panic!("{output}"));
+        let watcher = output
+            .find("event=\"watcher_stopped\"")
+            .unwrap_or_else(|| panic!("{output}"));
+        let completed = output
+            .find("event=\"server_shutdown_completed\"")
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(started < watcher && watcher < completed);
+
+        let output = capture_events(|| {
+            let result = finish_server_lifecycle(
+                Err(Error::new(ErrorClass::Http, "injected startup failure")),
+                || Ok(()),
+            );
+            assert!(result.is_err());
+        });
+        assert!(!output.contains("server_shutdown_started"));
+        assert!(!output.contains("server_shutdown_completed"));
+
+        let output = capture_events(|| {
+            tracing::info!(event = "server_shutdown_started");
+            let result = finish_server_lifecycle(Ok(()), || {
+                Err(Error::new(ErrorClass::Http, "injected watcher failure"))
+            });
+            assert!(result.is_err());
+        });
+        assert!(output.contains("server_shutdown_started"));
+        assert!(!output.contains("server_shutdown_completed"));
+    }
+
+    #[test]
+    fn readiness_and_watcher_events_are_transition_bound_and_paired() {
+        let ready = AtomicBool::new(false);
+        let output = capture_events(|| {
+            assert!(!set_readiness(&ready, false, "state_invalid"));
+            assert!(set_readiness(&ready, true, "state_validated"));
+            assert!(!set_readiness(&ready, true, "state_validated"));
+            assert!(set_readiness(&ready, false, "state_invalid"));
+            assert!(!set_readiness(&ready, false, "state_invalid"));
+
+            assert_eq!(
+                attempt_watcher_replacement("overflow", || Some(1_u8)),
+                Some(1)
+            );
+            assert_eq!(
+                attempt_watcher_replacement("drain_failed", || Some(2_u8)),
+                Some(2)
+            );
+            assert_eq!(
+                attempt_watcher_replacement::<u8, _>("wait_failed", || None),
+                None
+            );
+        });
+        assert_eq!(output.matches("event=\"readiness_changed\"").count(), 2);
+        assert_eq!(output.matches("event=\"watcher_failed\"").count(), 3);
+        assert_eq!(output.matches("event=\"watcher_replaced\"").count(), 2);
+        assert_eq!(output.matches("reason=\"state_invalid\"").count(), 1);
+        assert_eq!(output.matches("reason=\"overflow\"").count(), 2);
+        assert_eq!(output.matches("reason=\"drain_failed\"").count(), 2);
+        assert_eq!(output.matches("reason=\"wait_failed\"").count(), 1);
+    }
 
     #[test]
     fn rate_limiter_refills_incrementally_and_caps_bursts() {

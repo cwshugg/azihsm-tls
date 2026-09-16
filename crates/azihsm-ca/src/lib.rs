@@ -14,9 +14,13 @@ pub mod crypto;
 #[cfg(windows)]
 pub mod csr;
 #[cfg(windows)]
+pub mod encoding;
+#[cfg(windows)]
 pub mod error;
 #[cfg(windows)]
 pub mod http;
+#[cfg(windows)]
+pub mod logging;
 #[cfg(windows)]
 pub mod operations;
 #[cfg(windows)]

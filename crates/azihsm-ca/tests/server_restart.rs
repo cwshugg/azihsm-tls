@@ -67,7 +67,7 @@ fn enrollment_survives_server_restart() {
     let first = post(port, key, &csr_bytes);
     assert!(first.starts_with(b"HTTP/1.1 201"));
     let first_body = body(&first).to_vec();
-    stop(&mut server);
+    let first_log = stop(&mut server);
     let mut restarted = start_server(&state, port);
     wait_ready(port);
     let replay = post(port, key, &csr_bytes);
@@ -83,7 +83,26 @@ fn enrollment_survives_server_restart() {
     assert!(get(port, "/v1/ca").starts_with(b"HTTP/1.1 503"));
     fs::remove_dir(&incomplete).unwrap_or_else(|error| panic!("{error}"));
     wait_ready(port);
-    stop(&mut restarted);
+    let restart_log = stop(&mut restarted);
+    let logs = format!("{first_log}{restart_log}");
+    for event in [
+        "server_starting",
+        "state_format_validated",
+        "authority_opened",
+        "recovery_completed",
+        "readiness_changed",
+        "enrollment_accepted",
+        "enrollment_replayed",
+    ] {
+        assert!(logs.contains(event), "missing log event {event}: {logs}");
+    }
+    assert!(logs.contains("INFO"));
+    for forbidden in [text(&state), &key_name, "server.demo.internal", key] {
+        assert!(
+            !logs.contains(forbidden),
+            "sensitive value appeared in stdout log"
+        );
+    }
     let provider = AziProvider::open_named(PROVIDER_NAME).unwrap_or_else(|error| panic!("{error}"));
     let mut key = provider
         .open_key(&key_name)
@@ -109,7 +128,8 @@ fn start_server(state: &std::path::Path, port: u16) -> Child {
             "--allow-dns",
             "server.demo.internal",
         ])
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|error| panic!("server start failed: {error}"))
@@ -171,9 +191,17 @@ fn body(response: &[u8]) -> &[u8] {
     &response[position + 4..]
 }
 
-fn stop(child: &mut Child) {
+fn stop(child: &mut Child) -> String {
     child.kill().unwrap_or_else(|error| panic!("{error}"));
     child.wait().unwrap_or_else(|error| panic!("{error}"));
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap_or_else(|| panic!("server stdout was not captured"))
+        .read_to_string(&mut output)
+        .unwrap_or_else(|error| panic!("{error}"));
+    output
 }
 
 fn run(arguments: &[&str]) {

@@ -1,5 +1,6 @@
 //! Derive-based command-line contract and semantic validation.
 
+use crate::encoding::is_lower_hex_32;
 use crate::error::{Error, ErrorClass, Result};
 use crate::policy::{PROVIDER_NAME, warning_text};
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -25,8 +26,16 @@ enum CliCommand {
     Init(InitCli),
     #[command(long_about = warning_text())]
     Serve(ServeCli),
-    Inspect(StateOnly),
-    QuarantineIssuance(QuarantineCli),
+    Inspect {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    QuarantineIssuance {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        issuance_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -67,20 +76,6 @@ struct ServeCli {
     max_connections: u8,
     #[arg(long)]
     allow_insecure_demo_http_nonloopback: bool,
-}
-
-#[derive(Debug, Args)]
-struct StateOnly {
-    #[arg(long)]
-    state_dir: PathBuf,
-}
-
-#[derive(Debug, Args)]
-struct QuarantineCli {
-    #[arg(long)]
-    state_dir: PathBuf,
-    #[arg(long, value_parser = parse_hex32)]
-    issuance_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,10 +121,6 @@ pub struct ServeArgs {
     pub allow_ip: Vec<IpAddr>,
     pub leaf_valid_hours: u16,
     pub max_connections: u8,
-    pub max_request_body_bytes: usize,
-    pub per_source_per_minute: u16,
-    pub global_per_minute: u16,
-    pub insecure_nonloopback_acknowledged: bool,
 }
 
 pub fn parse<I>(arguments: I) -> Result<Command>
@@ -155,12 +146,13 @@ fn convert(command: CliCommand) -> Result<Command> {
     match command {
         CliCommand::Init(args) => init(args),
         CliCommand::Serve(args) => serve(args),
-        CliCommand::Inspect(args) => Ok(Command::Inspect {
-            state_dir: args.state_dir,
-        }),
-        CliCommand::QuarantineIssuance(args) => Ok(Command::Quarantine {
-            state_dir: args.state_dir,
-            issuance_id: args.issuance_id,
+        CliCommand::Inspect { state_dir } => Ok(Command::Inspect { state_dir }),
+        CliCommand::QuarantineIssuance {
+            state_dir,
+            issuance_id,
+        } => Ok(Command::Quarantine {
+            state_dir,
+            issuance_id,
         }),
     }
 }
@@ -228,10 +220,6 @@ fn serve(args: ServeCli) -> Result<Command> {
         allow_ip: ips.into_iter().collect(),
         leaf_valid_hours: args.leaf_validity_days * 24,
         max_connections: args.max_connections,
-        max_request_body_bytes: 16_384,
-        per_source_per_minute: 10,
-        global_per_minute: 60,
-        insecure_nonloopback_acknowledged: args.allow_insecure_demo_http_nonloopback,
     }))
 }
 
@@ -273,11 +261,7 @@ fn parse_dns(value: &str) -> std::result::Result<String, String> {
 }
 
 fn parse_hex32(value: &str) -> std::result::Result<String, String> {
-    if value.len() == 32
-        && value
-            .bytes()
-            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
-    {
+    if is_lower_hex_32(value) {
         Ok(value.to_owned())
     } else {
         Err("value must be exactly 32 lowercase hexadecimal digits".to_owned())

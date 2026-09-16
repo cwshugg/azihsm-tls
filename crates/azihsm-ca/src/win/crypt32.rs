@@ -81,18 +81,6 @@ impl CertContext {
         Ok(())
     }
 
-    pub fn release(mut self) -> Result<()> {
-        let ok = unsafe { CertFreeCertificateContext(self.0) };
-        self.0 = null_mut();
-        if ok == 0 {
-            return Err(bool_error(
-                ErrorClass::Cleanup,
-                "CertFreeCertificateContext",
-            ));
-        }
-        Ok(())
-    }
-
     fn encoded(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts((*self.0).pbCertEncoded, (*self.0).cbCertEncoded as usize)

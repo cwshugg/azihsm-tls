@@ -4,7 +4,9 @@ use crate::cert::{CertificateBacking, certificate_not_after};
 use crate::cli::{InitArgs, InitMode, ServeArgs};
 use crate::crypto::{hash_sha256, random};
 use crate::csr::ParsedCsr;
+use crate::encoding::{canonical_json, is_lower_hex_32};
 use crate::error::{Error, ErrorClass, Result};
+use crate::policy::CLOCK_SKEW_SECONDS;
 use crate::state::{
     AuditRecord, Authority, CompleteRecord, IdempotencyRecord, InitGeneration, InitPhase,
     InitPublication, IssuanceCommit, IssuanceIntent, IssuanceRecord, RootSigningIntent,
@@ -41,7 +43,11 @@ pub struct Issued {
 }
 
 pub fn initialize(args: InitArgs) -> Result<()> {
-    match args.mode {
+    let recover = matches!(
+        &args.mode,
+        InitMode::Fresh { .. } | InitMode::Reconcile { .. }
+    );
+    let result = match args.mode {
         InitMode::Fresh {
             provider,
             key_name,
@@ -60,7 +66,46 @@ pub fn initialize(args: InitArgs) -> Result<()> {
             let _lock = StateLock::acquire(&args.state_dir, false)?;
             abandon(&args.state_dir, &operation_id)
         }
+    };
+    finish_initialization(
+        result,
+        recover,
+        crate::logging::enabled(),
+        || -> Result<(Authority, (usize, usize, usize))> {
+            let authority: Authority =
+                read_json(&args.state_dir.join("authority.json"), AUTHORITY_CAP)?;
+            Ok((authority, recovery_counts(&args.state_dir)?))
+        },
+    )
+}
+
+fn finish_initialization<F>(
+    result: Result<()>,
+    recover: bool,
+    logging_enabled: bool,
+    enrich: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<(Authority, (usize, usize, usize))>,
+{
+    result?;
+    if logging_enabled {
+        tracing::info!(
+            event = "state_format_validated",
+            version = crate::state::STATE_FORMAT_VERSION,
+            producer = crate::state::STATE_PRODUCER
+        );
+        if recover && let Ok((authority, (issuances, reservations, audits))) = enrich() {
+            tracing::info!(
+                event = "recovery_completed",
+                authority_id = authority.authority_id,
+                completed_issuances = issuances,
+                serial_reservations = reservations,
+                audit_records = audits
+            );
+        }
     }
+    Ok(())
 }
 
 fn fresh_init(
@@ -446,7 +491,7 @@ fn create_init_publication(
         root_ski_hex: hex(&root_context.subject_key_identifier()?),
         not_before: time_from_system(
             reference_time
-                .checked_sub(Duration::from_secs(300))
+                .checked_sub(Duration::from_secs(CLOCK_SKEW_SECONDS as u64))
                 .ok_or_else(|| Error::new(ErrorClass::Validation, "root time underflow"))?,
         )?,
         not_after: time_from_system(
@@ -549,13 +594,7 @@ fn publish_init_transaction(
     )?;
     let root_der = decode_hex_vec(&publication.root_der_hex)?;
     publish_exact_or_validate(&state_dir.join("root.der"), &root_der)?;
-    let mut authority_bytes = serde_json::to_vec(&publication.authority).map_err(|error| {
-        Error::new(
-            ErrorClass::State,
-            format!("authority encoding failed: {error}"),
-        )
-    })?;
-    authority_bytes.push(b'\n');
+    let authority_bytes = canonical_json(&publication.authority, "authority")?;
     publish_exact_or_validate(&state_dir.join("authority.json"), &authority_bytes)
 }
 
@@ -779,6 +818,14 @@ pub fn inspect(state_dir: &Path) -> Result<String> {
     .map_err(|error| Error::new(ErrorClass::State, format!("inspect output failed: {error}")))
 }
 
+pub(crate) fn recovery_counts(state_dir: &Path) -> Result<(usize, usize, usize)> {
+    Ok((
+        completed_issuance_ids(state_dir)?.len(),
+        numbered_json_entries(&state_dir.join("serial-reservations"))?.len(),
+        numbered_json_entries(&state_dir.join("audit"))?.len(),
+    ))
+}
+
 pub fn issue(
     loaded: &LoadedAuthority,
     policy: &ServeArgs,
@@ -851,7 +898,6 @@ pub fn issue(
     let root_context = CertContext::create(&loaded.root_der)?;
     let root_ski = root_context.subject_key_identifier()?;
     let backing = CertificateBacking::leaf(
-        root_context.subject()?,
         &parsed.public_blob,
         serial,
         &root_ski,
@@ -1177,11 +1223,7 @@ pub fn quarantine(state_dir: &Path, issuance_id: &str) -> Result<()> {
 }
 
 pub fn certificate_status(state_dir: &Path, issuance_id: &str) -> Result<Option<String>> {
-    if issuance_id.len() != 32
-        || !issuance_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_lower_hex_32(issuance_id) {
         return Ok(None);
     }
     let directory = state_dir.join("issuances").join(issuance_id);
@@ -1216,8 +1258,11 @@ pub fn certificate_status(state_dir: &Path, issuance_id: &str) -> Result<Option<
 }
 
 pub fn certificate_bytes(state_dir: &Path, issuance_id: &str) -> Result<Option<Vec<u8>>> {
+    if !is_lower_hex_32(issuance_id) {
+        return Ok(None);
+    }
     let directory = state_dir.join("issuances").join(issuance_id);
-    if issuance_id.len() != 32 || !directory.join("COMPLETE").exists() {
+    if !directory.join("COMPLETE").exists() {
         return Ok(None);
     }
     Ok(Some(read_bounded(
@@ -1322,13 +1367,7 @@ where
 {
     let value: T = serde_json::from_slice(bytes)
         .map_err(|error| Error::new(ErrorClass::State, format!("invalid {label}: {error}")))?;
-    let mut canonical = serde_json::to_vec(&value).map_err(|error| {
-        Error::new(
-            ErrorClass::State,
-            format!("{label} encoding failed: {error}"),
-        )
-    })?;
-    canonical.push(b'\n');
+    let canonical = canonical_json(&value, label)?;
     if canonical != bytes {
         return Err(Error::new(
             ErrorClass::Validation,
@@ -1613,24 +1652,12 @@ fn recover_issuance_commit(
         certificate_sha256: record.certificate_sha256.clone(),
         record_sha256: hex(&hash_sha256(&record_bytes)?),
     };
-    let mut complete_bytes = serde_json::to_vec(&complete).map_err(|error| {
-        Error::new(
-            ErrorClass::State,
-            format!("completion encoding failed: {error}"),
-        )
-    })?;
-    complete_bytes.push(b'\n');
+    let complete_bytes = canonical_json(&complete, "completion")?;
     publish_exact_or_validate(&issuance_dir.join("COMPLETE"), &complete_bytes)?;
     let mapping_path = state_dir
         .join("idempotency")
         .join(format!("{}.json", commit.idempotency.key_hash));
-    let mut mapping_bytes = serde_json::to_vec(&commit.idempotency).map_err(|error| {
-        Error::new(
-            ErrorClass::State,
-            format!("idempotency encoding failed: {error}"),
-        )
-    })?;
-    mapping_bytes.push(b'\n');
+    let mapping_bytes = canonical_json(&commit.idempotency, "idempotency")?;
     publish_exact_or_validate(&mapping_path, &mapping_bytes)?;
     ensure_issuance_audit(state_dir, &commit)?;
     publish_exact_or_validate(
@@ -2085,7 +2112,7 @@ fn leaf_validity_interval(
     root_expiry: time::OffsetDateTime,
 ) -> Result<(SystemTime, SystemTime)> {
     let not_before = now
-        .checked_sub(Duration::from_secs(300))
+        .checked_sub(Duration::from_secs(CLOCK_SKEW_SECONDS as u64))
         .ok_or_else(|| Error::new(ErrorClass::Validation, "leaf time underflow"))?;
     let requested_not_after = now
         .checked_add(Duration::from_secs(u64::from(requested_hours) * 3_600))
@@ -2138,6 +2165,22 @@ mod tests {
             init_operation_id: "operation".to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
         }
+    }
+
+    #[test]
+    fn logging_enrichment_failure_does_not_change_success() {
+        let result = finish_initialization(Ok(()), true, true, || {
+            Err(Error::new(ErrorClass::State, "injected enrichment failure"))
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn disabled_logging_performs_no_enrichment_io() {
+        let result = finish_initialization(Ok(()), true, false, || {
+            panic!("logging-only enrichment must not run")
+        });
+        assert!(result.is_ok());
     }
 
     fn committed_issuance(state_dir: &Path) -> (PathBuf, Authority) {
@@ -2322,7 +2365,10 @@ mod tests {
         let root_expiry = time::OffsetDateTime::from(now + Duration::from_secs(600));
         let (not_before, not_after) =
             leaf_validity_interval(now, 24, root_expiry).unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(not_before, now - Duration::from_secs(300));
+        assert_eq!(
+            not_before,
+            now - Duration::from_secs(CLOCK_SKEW_SECONDS as u64)
+        );
         assert_eq!(not_after, now + Duration::from_secs(600));
     }
 

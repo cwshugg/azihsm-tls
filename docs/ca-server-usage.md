@@ -4,6 +4,8 @@ This guide runs the Windows-only `azihsm-ca` demonstration server for a
 one-way TLS scenario. It is demo guidance, not production deployment advice.
 For implementation details and the full state model, see the
 [crate README](../crates/azihsm-ca/README.md).
+For reusable TLS-server key generation and enrollment automation, see the
+[PowerShell enrollment scripts](../scripts/README.md).
 
 ## Security and cryptographic boundary
 
@@ -225,6 +227,25 @@ print a separate "ready" banner. Readiness begins false while the state,
 named-key identity, root, journals, and issuance records are checked. Poll
 `/readyz`; do not treat a listening socket or `/livez` as readiness.
 
+Operational logs are compact, timestamp-free text written only to standard
+output. `serve` defaults to `info`. To select a different global level, set
+`RUST_LOG` to exactly `off`, `error`, `warn`, `info`, `debug`, or `trace`
+before starting the process:
+
+```powershell
+$env:RUST_LOG = 'debug'
+& $CaExe serve `
+    --state-dir $StateDir `
+    --listen '127.0.0.1:8080' `
+    --allow-dns 'server.demo.internal'
+```
+
+Module filters and comma-separated directives are rejected with exit code
+`2`. Offline commands do not enable logging unless `RUST_LOG` is explicitly
+set. Logs intentionally omit state paths, SIDs, source addresses, SANs,
+request/certificate bytes, public keys, key names and handles, idempotency
+material, and private material.
+
 ```powershell
 $CaBase = 'http://192.0.2.10:8080'
 Invoke-RestMethod "$CaBase/livez"
@@ -315,6 +336,11 @@ When unready, `/livez` remains `200`, while `/readyz` and state-dependent
 routes return `503` with `ca_not_ready`.
 
 ## One-way TLS enrollment
+
+The copy/paste workflow below documents the API contract directly. For
+validated two-stage automation with persistent idempotency and explicit
+CurrentUser/LocalMachine handling, use the
+[TLS server enrollment scripts](../scripts/README.md).
 
 ### 1. Generate the TLS server key and CSR
 
@@ -461,14 +487,14 @@ created for the CSR. When the request was created in the intended Windows
 certificate-store context, the usual starting point is:
 
 ```powershell
-certreq.exe -accept $Leaf
+certreq.exe -accept -user $Leaf
 ```
 
 Store selection, service binding, and private-key ACLs vary by TLS server. For
-example, a Windows service commonly needs a machine-store request and explicit
-permission for its service identity. Treat those values as deployment
-placeholders and verify that the installed leaf reports an associated private
-key before binding it.
+example, a Windows service commonly needs a machine-store request, an elevated
+`certreq.exe -accept -machine $Leaf`, and explicit permission for its service
+identity. Treat those values as deployment placeholders and verify that the
+installed leaf reports an associated private key before binding it.
 
 On the TLS-client machine, after independently verifying the root hash, import
 the root into the trust store used by that client. An administrator can use:

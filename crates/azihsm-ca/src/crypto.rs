@@ -6,7 +6,7 @@ use ring::{digest, rand, signature};
 pub fn random<const N: usize>() -> Result<[u8; N]> {
     let mut output = [0_u8; N];
     rand::SecureRandom::fill(&rand::SystemRandom::new(), &mut output)
-        .map_err(|_| Error::new(ErrorClass::Signing, "system random generation failed"))?;
+        .map_err(|_| Error::new(ErrorClass::Issuance, "system random generation failed"))?;
     Ok(output)
 }
 

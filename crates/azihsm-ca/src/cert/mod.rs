@@ -4,6 +4,7 @@ pub mod signer;
 
 use crate::crypto::{hash_sha1, public_point};
 use crate::error::{Error, ErrorClass, Result};
+use crate::policy::CLOCK_SKEW_SECONDS;
 use crate::win::ncrypt::AziKey;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -38,12 +39,12 @@ impl CertificateBacking {
             &serial.into_iter().rev().collect::<Vec<_>>(),
         ));
         params.not_before = offset(
-            now.checked_sub(Duration::from_secs(300))
-                .ok_or_else(|| Error::new(ErrorClass::Signing, "root notBefore underflow"))?,
+            now.checked_sub(Duration::from_secs(CLOCK_SKEW_SECONDS as u64))
+                .ok_or_else(|| Error::new(ErrorClass::Issuance, "root notBefore underflow"))?,
         )?;
         params.not_after = offset(
             now.checked_add(Duration::from_secs(u64::from(valid_days) * 86_400))
-                .ok_or_else(|| Error::new(ErrorClass::Signing, "root notAfter overflow"))?,
+                .ok_or_else(|| Error::new(ErrorClass::Issuance, "root notAfter overflow"))?,
         )?;
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
@@ -58,7 +59,6 @@ impl CertificateBacking {
 
     #[allow(clippy::too_many_arguments)]
     pub fn leaf(
-        _issuer: &[u8],
         public_blob: &[u8; 72],
         serial: [u8; 16],
         root_ski: &[u8; 20],
@@ -103,34 +103,6 @@ impl CertificateBacking {
         })
     }
 
-    pub fn issuer(&self) -> Result<Vec<u8>> {
-        let der = self.preview()?;
-        Ok(parse(&der)?.tbs_certificate.issuer.as_raw().to_vec())
-    }
-
-    pub fn subject(&self) -> Result<Vec<u8>> {
-        let der = self.preview()?;
-        Ok(parse(&der)?.tbs_certificate.subject.as_raw().to_vec())
-    }
-
-    pub fn serial_hex(&self) -> String {
-        self.params
-            .serial_number
-            .as_ref()
-            .map(|serial| {
-                serial
-                    .to_bytes()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn subject_key_identifier(&self) -> Result<[u8; 20]> {
-        hash_sha1(&public_point(&self.public_blob)?)
-    }
-
     pub fn to_be_signed_der(&self) -> Result<Vec<u8>> {
         let der = self.preview()?;
         Ok(parse(&der)?.tbs_certificate.as_ref().to_vec())
@@ -153,7 +125,7 @@ impl CertificateBacking {
             .map_err(|error| {
                 signing_key.take_error().unwrap_or_else(|| {
                     Error::new(
-                        ErrorClass::Signing,
+                        ErrorClass::Issuance,
                         format!("rcgen signing failed: {error}"),
                     )
                 })

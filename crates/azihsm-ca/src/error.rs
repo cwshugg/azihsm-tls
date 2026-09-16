@@ -39,12 +39,6 @@ impl Error {
     }
 }
 
-#[allow(non_upper_case_globals)]
-impl ErrorClass {
-    pub(crate) const Signing: Self = Self::Issuance;
-    pub(crate) const Cleanup: Self = Self::State;
-}
-
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{:?}: {}", self.class, self.message)
