@@ -23,6 +23,7 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 | **Task** | **Status** | **Description** |
 |----------|------------|-----------------|
 | Implement Mock CLA | Done | See [`azihsm-ca`](crates/azihsm-ca) |
+| Initialize named TLS keys | Done | See [`keytool`](crates/keytool) |
 | Implement TLS Server | TODO | |
 | Test TLS-Server-to-Mock-CLA certificate issuing | TODO |
 | Implement TLS Client | TODO | |
@@ -37,6 +38,7 @@ This repo contains multiple Rust crates:
 * [`azihsm-ca`](crates/azihsm-ca) - A mock CA (Certificate Authority) server.
 * [`azihsm-ca-demo`](crates/azihsm-ca-demo) - A sample application demonstrating how a client would communicate with the mock CA server (`azihsm-ca`).
 * [`azihsm-ncrypt`](crates/azihsm-ncrypt) - A helper crate implementing shared code to interact with the AziHSM KSP in Windows.
+* [`keytool`](crates/keytool) - A CLI that initializes and exercises named AziHSM TLS keys (the key-management foundation for the TLS Server).
 
 ## Quick Start
 
