@@ -1,0 +1,17 @@
+[package]
+name = "azihsm-ncrypt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Narrow Windows NCrypt integration for named AziHSM P-256 keys"
+repository = "https://github.com/cwshugg/azihsm-tls"
+
+[dependencies]
+rcgen = { version = "=0.14.10", default-features = false }
+ring = { version = "=0.17.14", default-features = false, features = ["std"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
