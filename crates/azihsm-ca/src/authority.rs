@@ -18,7 +18,7 @@ use crate::state::{
 use crate::win::crypt32::{
     CertContext, spki_der_from_blob, verify_certificate_signature, verify_exclusive_chain,
 };
-use crate::win::ncrypt::{AzihsmKey, AzihsmProvider, E_UNEXPECTED_STATUS};
+use azihsm_ncrypt::{AzihsmKey, AzihsmProvider, E_UNEXPECTED_STATUS};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

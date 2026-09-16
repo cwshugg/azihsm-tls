@@ -30,15 +30,6 @@ pub fn private_key_notice() {
     );
 }
 
-pub fn http_request(
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Option<Body<'_>>,
-) -> Result<()> {
-    http_request_to(default_sink().as_ref(), method, path, headers, body)
-}
-
 pub fn http_request_to(
     sink: &dyn TranscriptSink,
     method: &str,
@@ -56,16 +47,6 @@ pub fn http_request_to(
         body,
     )?);
     Ok(())
-}
-
-pub fn http_response(
-    method: &str,
-    path: &str,
-    status: u16,
-    headers: &[(&str, &str)],
-    body: Body<'_>,
-) -> Result<()> {
-    http_response_to(default_sink().as_ref(), method, path, status, headers, body)
 }
 
 pub fn http_response_to(

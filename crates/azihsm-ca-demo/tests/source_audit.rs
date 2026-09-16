@@ -13,7 +13,6 @@ fn demo_has_no_private_export_overwrite_or_software_signer_path() {
     for exact in [
         "azihsm-ca-client = { path = \"../azihsm-ca-client\" }",
         "tracing = { version = \"=0.1.44\", default-features = false, features = [\"std\"] }",
-        "tracing-subscriber = { version = \"=0.3.23\", default-features = false, features = [\"fmt\", \"std\"] }",
     ] {
         assert!(manifest.contains(exact), "missing {exact}");
     }
@@ -34,6 +33,9 @@ fn demo_has_no_private_export_overwrite_or_software_signer_path() {
     let client_manifest =
         fs::read_to_string(client.join("Cargo.toml")).unwrap_or_else(|error| panic!("{error}"));
     assert!(client_manifest.contains("ureq = { version = \"=3.4.2\", default-features = false }"));
+    assert!(client_manifest.contains(
+        "tracing-subscriber = { version = \"=0.3.23\", default-features = false, features = [\"fmt\", \"std\"] }"
+    ));
     collect(&client.join("src"), &mut source);
     let mut naming_source = source.clone();
     let ca = root

@@ -8,7 +8,7 @@ const RETRY_GUIDANCE: &str = "After restarting or reconfiguring the CA, run `azi
     --output-dir <same-directory> --acknowledge-plain-http`. Retry reuses the existing AziHSM key, \
     CSR, and idempotency key; do not run create again.";
 
-pub fn create(args: CreateArgs) -> Result<()> {
+pub(crate) fn create(args: CreateArgs) -> Result<()> {
     let _lock = StateLock::acquire(&args.output_dir)?;
     artifacts::create(artifacts::CreateArgs {
         output_dir: args.output_dir,
@@ -21,7 +21,7 @@ pub fn create(args: CreateArgs) -> Result<()> {
     })
 }
 
-pub fn retry(args: RetryArgs) -> Result<()> {
+pub(crate) fn retry(args: RetryArgs) -> Result<()> {
     let _lock = StateLock::acquire(&args.output_dir)?;
     artifacts::retry(artifacts::RetryArgs {
         output_dir: args.output_dir,
@@ -29,14 +29,14 @@ pub fn retry(args: RetryArgs) -> Result<()> {
     })
 }
 
-pub fn show(args: OutputArgs) -> Result<()> {
+pub(crate) fn show(args: OutputArgs) -> Result<()> {
     let _lock = StateLock::acquire(&args.output_dir)?;
     artifacts::show(artifacts::OutputArgs {
         output_dir: args.output_dir,
     })
 }
 
-pub fn delete_key(args: DeleteKeyArgs) -> Result<()> {
+pub(crate) fn delete_key(args: DeleteKeyArgs) -> Result<()> {
     let _lock = StateLock::acquire(&args.output_dir)?;
     artifacts::delete_key(artifacts::DeleteKeyArgs {
         output_dir: args.output_dir,

@@ -1,9 +1,9 @@
 //! Independent Windows certificate-context and exclusive-chain acceptance oracle.
 
-use crate::cert::signer::PublicP256Key;
 use crate::error::{Error, ErrorClass, Result};
 use crate::policy::SERVER_AUTH_OID;
 use crate::win::{bool_error, usize_to_u32};
+use azihsm_ncrypt::PublicP256Key;
 use rcgen::PublicKeyData;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Security::Cryptography::*;

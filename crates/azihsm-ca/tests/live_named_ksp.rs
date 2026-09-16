@@ -7,7 +7,7 @@ use azihsm_ca::state::{
     Authority, IssuanceIntent, SCHEMA_VERSION, SerialReservation, create_protected_dir,
     durable_bytes, durable_json,
 };
-use azihsm_ca::win::ncrypt::AzihsmProvider;
+use azihsm_ncrypt::AzihsmProvider;
 use std::env;
 use std::fs;
 use std::path::PathBuf;

@@ -90,9 +90,9 @@ impl CaClient {
 
     pub fn ready_typed(&self) -> std::result::Result<(), CaFailure> {
         let operation = CaOperation::Readiness;
-        tracing::info!(
-            event = "readiness_check_started",
-            message = "Checking whether the CA is ready to issue certificates."
+        crate::info_event(
+            "readiness_check_started",
+            "Checking whether the CA is ready to issue certificates.",
         );
         let (status, content_type, body) =
             self.get_typed(operation, "/readyz", "application/json", JSON_LIMIT)?;
@@ -116,9 +116,9 @@ impl CaClient {
         let response: ReadyResponse =
             parse_json(&body).map_err(|source| Self::protocol(operation, source))?;
         if response.schema_version != 1 || !response.ready {
-            tracing::warn!(
-                event = "readiness_check_not_ready",
-                message = "The CA is not ready, so certificate issuance cannot safely continue."
+            crate::warn_event(
+                "readiness_check_not_ready",
+                "The CA is not ready, so certificate issuance cannot safely continue.",
             );
             return Err(CaFailure {
                 kind: if response.schema_version == 1 {
@@ -130,9 +130,9 @@ impl CaClient {
                 source: http("CA readiness response was not ready"),
             });
         }
-        tracing::info!(
-            event = "readiness_check_completed",
-            message = "The CA reports that it is ready to issue certificates."
+        crate::info_event(
+            "readiness_check_completed",
+            "The CA reports that it is ready to issue certificates.",
         );
         Ok(())
     }
@@ -143,9 +143,9 @@ impl CaClient {
 
     pub fn metadata_typed(&self) -> std::result::Result<CaMetadata, CaFailure> {
         let operation = CaOperation::Metadata;
-        tracing::info!(
-            event = "ca_metadata_fetch_started",
-            message = "Reading the CA authority identity and supported certificate endpoints."
+        crate::info_event(
+            "ca_metadata_fetch_started",
+            "Reading the CA authority identity and supported certificate endpoints.",
         );
         let (status, content_type, body) =
             self.get_typed(operation, "/v1/ca", "application/json", JSON_LIMIT)?;
@@ -192,10 +192,9 @@ impl CaClient {
 
     pub fn root_typed(&self) -> std::result::Result<Vec<u8>, CaFailure> {
         let operation = CaOperation::Root;
-        tracing::info!(
-            event = "root_fetch_started",
-            message =
-                "Fetching the public CA root for local verification and client trust provisioning."
+        crate::info_event(
+            "root_fetch_started",
+            "Fetching the public CA root for local verification and client trust provisioning.",
         );
         let (status, content_type, body) = self.get_typed(
             operation,
@@ -227,10 +226,9 @@ impl CaClient {
         }
         require_content_type(content_type.as_deref(), "application/pkix-cert")
             .map_err(|source| Self::protocol(operation, source))?;
-        tracing::info!(
-            event = "root_fetch_completed",
-            message =
-                "The public CA root was fetched for verification and independent client trust."
+        crate::info_event(
+            "root_fetch_completed",
+            "The public CA root was fetched for verification and independent client trust.",
         );
         Ok(body)
     }
@@ -256,9 +254,9 @@ impl CaClient {
         recovery_guidance: &str,
     ) -> std::result::Result<Enrollment, CaFailure> {
         let operation = CaOperation::Enrollment;
-        tracing::info!(
-            event = "enrollment_started",
-            message = "Submitting the public CSR, which proves key possession without sending the private key; the idempotency key makes retries replay-safe."
+        crate::info_event(
+            "enrollment_started",
+            "Submitting the public CSR, which proves key possession without sending the private key; the idempotency key makes retries replay-safe.",
         );
         let url = self.url("/v1/certificates");
         transcript::http_request_to(
@@ -428,9 +426,9 @@ impl CaClient {
     }
 
     fn protocol(operation: CaOperation, source: Error) -> CaFailure {
-        tracing::warn!(
-            event = "ca_protocol_failed",
-            message = "The CA response did not match the bounded protocol contract, so the client fails closed."
+        crate::warn_event(
+            "ca_protocol_failed",
+            "The CA response did not match the bounded protocol contract, so the client fails closed.",
         );
         CaFailure {
             kind: CaFailureKind::Protocol,

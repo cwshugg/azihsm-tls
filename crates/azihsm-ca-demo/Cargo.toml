@@ -9,7 +9,6 @@ repository = "https://github.com/cwshugg/azihsm-tls"
 
 [dependencies]
 azihsm-ca-client = { path = "../azihsm-ca-client" }
-azihsm-ncrypt = { path = "../azihsm-ncrypt" }
 clap = { version = "=4.6.7", default-features = false, features = [
     "derive",
     "std",
@@ -17,7 +16,4 @@ clap = { version = "=4.6.7", default-features = false, features = [
     "usage",
     "error-context",
 ] }
-pem = "=3.0.6"
-time = { version = "=0.3.55", default-features = false, features = ["std", "formatting", "parsing"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }

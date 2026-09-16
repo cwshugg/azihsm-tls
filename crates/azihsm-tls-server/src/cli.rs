@@ -1,51 +1,52 @@
 //! Command-line contract for TLS serving and identity inspection.
 
+use azihsm_ca_client::validation::{validate_ca_url, validate_dns, validate_ip, validate_key_name};
 use clap::{Args, Parser, Subcommand};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "azihsm-tls-server", version, about)]
-pub struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub(crate) command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     Run(RunArgs),
     Show(StateArgs),
     DeleteKey(DeleteArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct RunArgs {
+pub(crate) struct RunArgs {
     #[arg(long)]
-    pub state_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8443")]
-    pub listen: SocketAddr,
-    #[arg(long = "dns", value_parser = crate::ca_cli::validate_dns)]
-    pub dns: Vec<String>,
-    #[arg(long = "ip", value_parser = crate::ca_cli::validate_ip)]
-    pub ip: Vec<IpAddr>,
-    #[arg(long, value_parser = crate::ca_cli::validate_ca_url)]
-    pub ca_url: String,
+    pub(crate) listen: SocketAddr,
+    #[arg(long = "dns", value_parser = validate_dns)]
+    pub(crate) dns: Vec<String>,
+    #[arg(long = "ip", value_parser = validate_ip)]
+    pub(crate) ip: Vec<IpAddr>,
+    #[arg(long, value_parser = validate_ca_url)]
+    pub(crate) ca_url: String,
     #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
-    pub acknowledge_plain_http: bool,
-    #[arg(long, value_parser = crate::ca_cli::validate_key_name)]
-    pub key_name: Option<String>,
+    pub(crate) acknowledge_plain_http: bool,
+    #[arg(long, value_parser = validate_key_name)]
+    pub(crate) key_name: Option<String>,
 }
 
 #[derive(Debug, Args)]
-pub struct StateArgs {
+pub(crate) struct StateArgs {
     #[arg(long)]
-    pub state_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
-pub struct DeleteArgs {
+pub(crate) struct DeleteArgs {
     #[arg(long)]
-    pub state_dir: PathBuf,
-    #[arg(long, value_parser = crate::ca_cli::validate_key_name)]
-    pub confirm_key_name: String,
+    pub(crate) state_dir: PathBuf,
+    #[arg(long, value_parser = validate_key_name)]
+    pub(crate) confirm_key_name: String,
 }

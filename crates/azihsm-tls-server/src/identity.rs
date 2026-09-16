@@ -1,8 +1,6 @@
 //! Shared synchronous identity preparation for the AziHSM TLS server.
 
-use crate::ca_cli::{CreateArgs, DeleteKeyArgs};
-use crate::{Error, ErrorClass, Result, workflow};
-use azihsm_ca_client::files;
+use crate::{Error, ErrorClass, Result};
 use azihsm_ca_client::model::{
     CSR_DER, ISSUANCE_METADATA, IssuanceMetadata, LEAF_DER, PUBLIC_DER, REQUEST_METADATA, ROOT_DER,
     RequestMetadata, SCHEMA_VERSION,
@@ -10,6 +8,7 @@ use azihsm_ca_client::model::{
 use azihsm_ca_client::{
     CaClient, CaFailure, CaFailureKind, CaOperation, csr, state_lock::StateLock, verify,
 };
+use azihsm_ca_client::{artifacts, files};
 use azihsm_ncrypt::{AzihsmSession, PROVIDER_NAME, hash_sha256, random};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -23,25 +22,28 @@ const RENEWALS: &str = "renewals";
 const INTENT: &str = "intent.json";
 const SELECTION: &str = "selection.json";
 const MAX_CACHE_AGE: Duration = Duration::days(7);
+const RETRY_GUIDANCE: &str = "After restarting or reconfiguring the CA, rerun \
+    azihsm-tls-server with the same state directory and identity arguments. The existing AziHSM \
+    key, CSR, and idempotency key will be reused.";
 
 /// Immutable identity requested by the TLS server.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpectedIdentity {
-    pub dns: Vec<String>,
-    pub ips: Vec<IpAddr>,
-    pub spki_der: Vec<u8>,
+pub(crate) struct ExpectedIdentity {
+    pub(crate) dns: Vec<String>,
+    pub(crate) ips: Vec<IpAddr>,
+    pub(crate) spki_der: Vec<u8>,
 }
 
 /// A verified certificate chain with explicit current-time bounds.
 #[derive(Debug, Clone)]
-pub struct ValidatedServerChain {
-    pub not_before: OffsetDateTime,
-    pub not_after: OffsetDateTime,
+pub(crate) struct ValidatedServerChain {
+    pub(crate) not_before: OffsetDateTime,
+    pub(crate) not_after: OffsetDateTime,
 }
 
 /// How startup selected its certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheOutcome {
+pub(crate) enum CacheOutcome {
     Created,
     Renewed,
     Current,
@@ -63,33 +65,28 @@ struct RenewalDecision {
 
 /// Inputs for synchronous key enrollment and cache selection.
 #[derive(Debug, Clone)]
-pub struct ServerPrepareOptions {
-    pub state_dir: PathBuf,
-    pub dns: Vec<String>,
-    pub ips: Vec<IpAddr>,
-    pub ca_url: String,
-    pub key_name: Option<String>,
-    pub now: OffsetDateTime,
+pub(crate) struct ServerPrepareOptions {
+    pub(crate) state_dir: PathBuf,
+    pub(crate) dns: Vec<String>,
+    pub(crate) ips: Vec<IpAddr>,
+    pub(crate) ca_url: String,
+    pub(crate) key_name: Option<String>,
+    pub(crate) now: OffsetDateTime,
 }
 
 /// Complete identity whose lock and provider-backed session outlive serving.
 #[derive(Debug)]
-pub struct PreparedIdentity {
-    pub session: Arc<AzihsmSession>,
-    pub key_name: String,
-    pub spki_der: Vec<u8>,
-    pub chain_der: Vec<Vec<u8>>,
-    pub root_der: Vec<u8>,
-    pub not_before: OffsetDateTime,
-    pub not_after: OffsetDateTime,
-    pub issuance_id: String,
-    pub cache_outcome: CacheOutcome,
+pub(crate) struct PreparedIdentity {
+    pub(crate) session: Arc<AzihsmSession>,
+    pub(crate) spki_der: Vec<u8>,
+    pub(crate) chain_der: Vec<Vec<u8>>,
+    pub(crate) not_after: OffsetDateTime,
     _state_lock: StateLock,
 }
 
 /// Closed preparation failures used by startup policy.
 #[derive(Debug)]
-pub enum PrepareIdentityError {
+pub(crate) enum PrepareIdentityError {
     Ca(CaFailure),
     State(Error),
     Provider(Error),
@@ -123,7 +120,6 @@ impl From<CaFailure> for PrepareIdentityError {
 struct Candidate {
     directory: PathBuf,
     operation_id: String,
-    root: Vec<u8>,
     leaf: Vec<u8>,
     issuance: IssuanceMetadata,
     validity: ValidatedServerChain,
@@ -147,28 +143,29 @@ struct SelectionRecord {
 }
 
 /// Prepares a persistent identity synchronously before a Tokio runtime exists.
-pub fn prepare_server_identity(
+pub(crate) fn prepare_server_identity(
     options: ServerPrepareOptions,
 ) -> std::result::Result<PreparedIdentity, PrepareIdentityError> {
-    tracing::info!(
-        event = "identity_preparation_started",
-        message = "Locking state, opening the AziHSM key, and selecting a verified certificate before Tokio starts."
+    azihsm_ca_client::info_event(
+        "identity_preparation_started",
+        "Locking state, opening the AziHSM key, and selecting a verified certificate before Tokio starts.",
     );
     let state_lock = StateLock::acquire(&options.state_dir).map_err(classify)?;
     let created = !options.state_dir.join(REQUEST_METADATA).exists();
     if created {
-        workflow::create(CreateArgs {
+        artifacts::create(artifacts::CreateArgs {
             output_dir: options.state_dir.clone(),
             subject_cn: subject_cn(&options)?,
             dns: options.dns.clone(),
             ip: options.ips.clone(),
             ca_url: options.ca_url.clone(),
             key_name: options.key_name.clone(),
+            retry_guidance: RETRY_GUIDANCE.to_owned(),
         })
         .map_err(classify)?;
     }
 
-    let request = workflow::load_request(&options.state_dir).map_err(classify)?;
+    let request = artifacts::load_request(&options.state_dir).map_err(classify)?;
     require_identity_match(&request, &options)?;
     let session =
         Arc::new(AzihsmSession::open(PROVIDER_NAME, &request.key_name).map_err(classify)?);
@@ -232,23 +229,18 @@ pub fn prepare_server_identity(
     );
     Ok(PreparedIdentity {
         session,
-        key_name: request.key_name,
         spki_der: spki,
         chain_der: tls_chain(selected.leaf),
-        root_der: selected.root,
-        not_before: selected.validity.not_before,
         not_after: selected.validity.not_after,
-        issuance_id: selected.issuance.issuance_id,
-        cache_outcome: outcome,
         _state_lock: state_lock,
     })
 }
 
 /// Prints the existing public identity and certificate summary under lock.
-pub fn show_server_identity(state_dir: &Path) -> Result<()> {
+pub(crate) fn show_server_identity(state_dir: &Path) -> Result<()> {
     let _lock = StateLock::acquire(state_dir)?;
-    let request = workflow::load_request(state_dir)?;
-    let spki = workflow::validate_stored_request(state_dir, &request)?;
+    let request = artifacts::load_request(state_dir)?;
+    let spki = artifacts::validate_stored_request(state_dir, &request)?;
     let expected = ExpectedIdentity {
         dns: request.dns_sans.clone(),
         ips: parse_ips(&request.ip_sans)?,
@@ -272,22 +264,22 @@ pub fn show_server_identity(state_dir: &Path) -> Result<()> {
     println!("Certificate not after: {}", selected.validity.not_after);
     println!(
         "Key deletion: {}",
-        workflow::deletion_status(state_dir, &request)?
+        artifacts::deletion_status(state_dir, &request)?
     );
     Ok(())
 }
 
 /// Deletes the exact persisted key using the durable deletion-intent protocol.
-pub fn delete_server_key(state_dir: &Path, confirmation: String) -> Result<()> {
+pub(crate) fn delete_server_key(state_dir: &Path, confirmation: String) -> Result<()> {
     let _lock = StateLock::acquire(state_dir)?;
-    workflow::delete_key(DeleteKeyArgs {
+    artifacts::delete_key(artifacts::DeleteKeyArgs {
         output_dir: state_dir.to_owned(),
         confirm_key_name: confirmation,
     })
 }
 
 /// Verifies the exact CA profile and explicit caller-supplied current time.
-pub fn validate_server_chain(
+pub(crate) fn validate_server_chain(
     root_der: &[u8],
     leaf_der: &[u8],
     expected: &ExpectedIdentity,
@@ -311,9 +303,9 @@ pub fn validate_server_chain(
 }
 
 pub(crate) fn log_renewal_started() {
-    tracing::info!(
-        event = "certificate_renewal_started",
-        message = "The certificate is missing, invalid, or within seven days of expiry, so startup is requesting a renewal."
+    azihsm_ca_client::info_event(
+        "certificate_renewal_started",
+        "The certificate is missing, invalid, or within seven days of expiry, so startup is requesting a renewal.",
     );
 }
 
@@ -408,9 +400,9 @@ fn renew(
     validate_server_chain(&reopened_root, &reopened_leaf, expected, now)
         .map_err(|source| protocol_failure(CaOperation::Enrollment, source))?;
     let _ = validity;
-    tracing::info!(
-        event = "certificate_renewal_completed",
-        message = "Renewal completed and the new certificate generation passed identity and validity checks."
+    azihsm_ca_client::info_event(
+        "certificate_renewal_completed",
+        "Renewal completed and the new certificate generation passed identity and validity checks.",
     );
     Ok(())
 }
@@ -459,9 +451,9 @@ fn load_candidates(
         match load_candidate(&directory, operation_id.clone(), expected, now) {
             Ok(candidate) => candidates.push(candidate),
             Err(_) => {
-                tracing::warn!(
-                    event = "certificate_generation_rejected",
-                    message = "Rejected a cached certificate generation because it did not pass verification."
+                azihsm_ca_client::warn_event(
+                    "certificate_generation_rejected",
+                    "Rejected a cached certificate generation because it did not pass verification.",
                 );
                 if directory != state_dir {
                     let quarantine = directory.with_file_name(format!("quarantine-{operation_id}"));
@@ -500,7 +492,6 @@ fn load_candidate(
     Ok(Candidate {
         directory: directory.to_owned(),
         operation_id,
-        root,
         leaf,
         issuance,
         validity,
@@ -646,9 +637,9 @@ fn select_or_renew(
             reload: true,
         }),
         Err(failure) if failure.kind == CaFailureKind::Availability && cached => {
-            tracing::warn!(
-                event = "renewal_availability_fallback",
-                message = "The CA is unavailable, so startup is using the already verified and still-valid cached certificate."
+            azihsm_ca_client::warn_event(
+                "renewal_availability_fallback",
+                "The CA is unavailable, so startup is using the already verified and still-valid cached certificate.",
             );
             Ok(RenewalDecision {
                 outcome: CacheOutcome::AvailabilityFallback,
@@ -799,6 +790,46 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    struct LevelCapture(Arc<Mutex<Vec<tracing::Level>>>);
+
+    impl Subscriber for LevelCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .push(*event.metadata().level());
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn routine_renewal_start_is_info() {
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(LevelCapture(Arc::clone(&levels)), log_renewal_started);
+        assert_eq!(
+            *levels.lock().unwrap_or_else(|error| panic!("{error}")),
+            [tracing::Level::INFO]
+        );
+    }
 
     #[test]
     fn candidate_order_uses_expiry_then_verification_then_operation() {

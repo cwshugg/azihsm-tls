@@ -1,7 +1,7 @@
 //! Clap command definitions and strict public-input validation.
 
-pub use azihsm_ca_client::validation::{
-    validate_ca_url, validate_cn, validate_dns, validate_ip, validate_key_name, validate_sans,
+use azihsm_ca_client::validation::{
+    validate_ca_url, validate_cn, validate_dns, validate_ip, validate_key_name,
 };
 use clap::{Args, Parser, Subcommand};
 use std::net::IpAddr;
@@ -9,13 +9,13 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "azihsm-ca-demo", version, about)]
-pub struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub(crate) command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     Create(CreateArgs),
     Retry(RetryArgs),
     Show(OutputArgs),
@@ -23,64 +23,49 @@ pub enum Command {
 }
 
 #[derive(Debug, Args)]
-pub struct CreateArgs {
+pub(crate) struct CreateArgs {
     #[arg(long)]
-    pub output_dir: PathBuf,
+    pub(crate) output_dir: PathBuf,
     #[arg(long, value_parser = validate_cn)]
-    pub subject_cn: String,
+    pub(crate) subject_cn: String,
     #[arg(long = "dns", value_parser = validate_dns)]
-    pub dns: Vec<String>,
+    pub(crate) dns: Vec<String>,
     #[arg(long = "ip", value_parser = validate_ip)]
-    pub ip: Vec<IpAddr>,
+    pub(crate) ip: Vec<IpAddr>,
     #[arg(long, value_parser = validate_ca_url)]
-    pub ca_url: String,
+    pub(crate) ca_url: String,
     #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
-    pub acknowledge_plain_http: bool,
+    pub(crate) acknowledge_plain_http: bool,
     #[arg(long, value_parser = validate_key_name)]
-    pub key_name: Option<String>,
+    pub(crate) key_name: Option<String>,
 }
 
 #[derive(Debug, Args)]
-pub struct RetryArgs {
+pub(crate) struct RetryArgs {
     #[arg(long)]
-    pub output_dir: PathBuf,
+    pub(crate) output_dir: PathBuf,
     #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
-    pub acknowledge_plain_http: bool,
+    pub(crate) acknowledge_plain_http: bool,
 }
 
 #[derive(Debug, Args)]
-pub struct OutputArgs {
+pub(crate) struct OutputArgs {
     #[arg(long)]
-    pub output_dir: PathBuf,
+    pub(crate) output_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
-pub struct DeleteKeyArgs {
+pub(crate) struct DeleteKeyArgs {
     #[arg(long)]
-    pub output_dir: PathBuf,
+    pub(crate) output_dir: PathBuf,
     #[arg(long, value_parser = validate_key_name)]
-    pub confirm_key_name: String,
+    pub(crate) confirm_key_name: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-
-    #[test]
-    fn rejects_missing_duplicate_and_wildcard_sans() {
-        assert!(validate_sans(&[], &[]).is_err());
-        assert!(validate_dns("*.example.test").is_err());
-        assert!(validate_dns("UPPER.example").is_err());
-        assert!(validate_sans(&["a.test".into(), "a.test".into()], &[]).is_err());
-        assert!(
-            validate_sans(
-                &[],
-                &["192.0.2.1".parse().unwrap(), "192.0.2.1".parse().unwrap()]
-            )
-            .is_err()
-        );
-    }
 
     #[test]
     fn cli_has_only_p256_workflow_and_requires_http_acknowledgement() {

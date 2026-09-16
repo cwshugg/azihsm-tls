@@ -42,9 +42,9 @@ fn verify_chain_inner(
     ips: &[IpAddr],
     check_current_time: bool,
 ) -> Result<()> {
-    tracing::info!(
-        event = "certificate_verification_started",
-        message = "Verifying root and leaf signatures, profile, validity, SANs, and the leaf public key against the AziHSM key."
+    crate::info_event(
+        "certificate_verification_started",
+        "Verifying root and leaf signatures, profile, validity, SANs, and the leaf public key against the AziHSM key.",
     );
     let root = parse(root_der, "root")?;
     let leaf = parse(leaf_der, "leaf")?;
@@ -70,9 +70,9 @@ fn verify_chain_inner(
     leaf.verify_signature(Some(&root.tbs_certificate.subject_pki))
         .map_err(|_| validation("leaf certificate signature is invalid"))?;
     verify_sans(&leaf, dns, ips)?;
-    tracing::info!(
-        event = "certificate_verification_completed",
-        message = "Certificate verification succeeded, so the leaf belongs to the requested AziHSM key and identity."
+    crate::info_event(
+        "certificate_verification_completed",
+        "Certificate verification succeeded, so the leaf belongs to the requested AziHSM key and identity.",
     );
     Ok(())
 }

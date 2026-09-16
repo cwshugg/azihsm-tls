@@ -3,7 +3,7 @@
 #![cfg(windows)]
 
 use azihsm_ca::policy::PROVIDER_NAME;
-use azihsm_ca::win::ncrypt::AzihsmProvider;
+use azihsm_ncrypt::AzihsmProvider;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};

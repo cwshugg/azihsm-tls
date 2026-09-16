@@ -139,17 +139,17 @@ pub async fn run(
             result = tokio::signal::ctrl_c() => {
                 result?;
                 expired = false;
-                tracing::info!(
-                    event = "shutdown_requested",
-                    message = "Stopping admission and draining existing TLS connections before releasing the key and state lock."
+                azihsm_ca_client::info_event(
+                    "shutdown_requested",
+                    "Stopping admission and draining existing TLS connections before releasing the key and state lock.",
                 );
                 break;
             }
             () = tokio::time::sleep_until(expiry) => {
                 expired = true;
-                tracing::warn!(
-                    event = "certificate_expired",
-                    message = "The selected certificate expired, so the listener stopped and no further handshakes or responses are allowed."
+                azihsm_ca_client::warn_event(
+                    "certificate_expired",
+                    "The selected certificate expired, so the listener stopped and no further handshakes or responses are allowed.",
                 );
                 break;
             }
@@ -169,10 +169,9 @@ pub async fn run(
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    tracing::info!(
-        event = "listener_stopped",
-        message =
-            "The listener stopped after connection tasks drained or were boundedly cancelled."
+    azihsm_ca_client::info_event(
+        "listener_stopped",
+        "The listener stopped after connection tasks drained or were boundedly cancelled.",
     );
     Ok(())
 }

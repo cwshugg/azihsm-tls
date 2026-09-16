@@ -1,7 +1,6 @@
 //! Safe ownership wrappers and Windows cryptography operations.
 
 pub mod crypt32;
-pub mod ncrypt;
 
 use crate::error::{Error, ErrorClass};
 

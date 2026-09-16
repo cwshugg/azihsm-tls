@@ -43,61 +43,6 @@ fn exact_ca_response_dtos_are_shared() {
     assert_eq!(metadata.certificates, "/v1/certificates");
 }
 
-#[test]
-fn human_narration_coexists_with_stable_events_and_safe_wording() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or_else(|| panic!("client crate has no workspace parent"));
-    let shared = collect_source(&workspace.join("azihsm-ca-client").join("src"));
-    let demo = collect_source(&workspace.join("azihsm-ca-demo").join("src"));
-    let server = collect_source(&workspace.join("azihsm-tls-server").join("src"));
-    for (event, phrase) in [
-        ("readiness_check_started", "ready to issue certificates"),
-        ("ca_metadata_fetch_started", "authority identity"),
-        ("root_fetch_started", "public CA root"),
-        ("enrollment_started", "without sending the private key"),
-        ("enrollment_completed", "idempotent retry"),
-        ("enrollment_completed", "issued a new certificate"),
-        (
-            "certificate_verification_started",
-            "signatures, profile, validity, SANs",
-        ),
-        (
-            "certificate_verification_completed",
-            "belongs to the requested AziHSM key",
-        ),
-        ("ca_request_failed", "exact bounded response"),
-    ] {
-        assert!(shared.contains(event), "missing shared event {event}");
-        assert!(shared.contains(phrase), "missing shared narration {phrase}");
-    }
-    for phrase in [
-        "Creating one named AziHSM key",
-        "Retrying enrollment with the existing key",
-        "Showing public certificate metadata",
-        "irreversibly deleting the exact named AziHSM key",
-    ] {
-        assert!(
-            shared.contains(phrase) || demo.contains(phrase),
-            "missing demo narration {phrase}"
-        );
-    }
-    for phrase in [
-        "bind address controls network reachability",
-        "all 64 bounded connection permits",
-        "server does not authenticate the client",
-        "four-byte-length-prefixed frame",
-        "TLS close_notify",
-        "selected certificate expired",
-    ] {
-        assert!(server.contains(phrase), "missing server narration {phrase}");
-    }
-    let all = format!("{shared}{demo}{server}");
-    assert!(!all.contains(concat!("server authenticated", " the client")));
-    assert!(!all.contains(concat!("private key bytes", " were exported")));
-    assert!(!all.contains(concat!("private key handle", " was printed")));
-}
-
 fn collect_source(directory: &Path) -> String {
     fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("{error}"))

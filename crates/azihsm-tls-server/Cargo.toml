@@ -18,7 +18,6 @@ clap = { version = "=4.6.7", default-features = false, features = [
     "usage",
     "error-context",
 ] }
-pem = "=3.0.6"
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 time = { version = "=0.3.55", default-features = false, features = ["std"] }
@@ -33,7 +32,6 @@ tokio = { version = "=1.53.1", features = [
 ] }
 tokio-rustls = { version = "=0.26.5", default-features = false }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
 x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
 
 [dev-dependencies]

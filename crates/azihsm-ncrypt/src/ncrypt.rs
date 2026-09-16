@@ -4,13 +4,13 @@ use crate::handles::{NcryptKey, NcryptProvider};
 use crate::{Error, ErrorClass, Result, hash_sha256, public_point, random, verify_p256_sha256};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::NTE_BAD_KEYSET;
 use windows_sys::Win32::Security::Cryptography::*;
 
 #[cfg(test)]
 static SIGN_HASH_CALLS: AtomicUsize = AtomicUsize::new(0);
-static LOGICAL_SIGNATURES: AtomicUsize = AtomicUsize::new(0);
 
 pub const PROVIDER_NAME: &str = "Microsoft Azure Integrated HSM Key Storage Provider";
 pub const E_UNEXPECTED_STATUS: i32 = 0x8000_ffff_u32 as i32;
@@ -114,7 +114,7 @@ pub struct AzihsmKey {
 #[derive(Debug)]
 pub struct AzihsmSession {
     key: Mutex<AzihsmKey>,
-    provider: AzihsmProvider,
+    _provider: AzihsmProvider,
 }
 
 impl AzihsmSession {
@@ -126,7 +126,7 @@ impl AzihsmSession {
         })?;
         Ok(Self {
             key: Mutex::new(key),
-            provider,
+            _provider: provider,
         })
     }
 
@@ -140,23 +140,12 @@ impl AzihsmSession {
         self.lock()?.public_blob()
     }
 
-    /// Signs one SHA-256 digest and records one logical production signature.
+    /// Signs one SHA-256 digest for a production TLS CertificateVerify.
     pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
         tracing::debug!(event = "certificate_verify_sign_started");
         let signature = self.lock()?.sign(digest)?;
-        LOGICAL_SIGNATURES.fetch_add(1, Ordering::SeqCst);
         tracing::info!(event = "certificate_verify_sign_completed");
         Ok(signature)
-    }
-
-    /// Deletes the uniquely owned named key while its provider remains live.
-    pub fn delete(self) -> Result<()> {
-        let key = self.key.into_inner().map_err(|_| {
-            Error::new(ErrorClass::Provider, "AziHSM key session mutex is poisoned")
-        })?;
-        key.delete()?;
-        drop(self.provider);
-        Ok(())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, AzihsmKey>> {
@@ -164,11 +153,6 @@ impl AzihsmSession {
             .lock()
             .map_err(|_| Error::new(ErrorClass::Provider, "AziHSM key session mutex is poisoned"))
     }
-}
-
-/// Returns the process-wide count of completed logical session signatures.
-pub fn logical_signature_count() -> usize {
-    LOGICAL_SIGNATURES.load(Ordering::SeqCst)
 }
 
 impl AzihsmKey {
@@ -224,7 +208,7 @@ impl AzihsmKey {
         Ok(blob)
     }
 
-    pub fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
+    pub(crate) fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64]> {
         let mut size = 0;
         let status = ncrypt_sign_hash(self.key.0, digest, None, &mut size);
         if status < 0 || size != 64 || size as usize > MAX_SIGNATURE {

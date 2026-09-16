@@ -149,23 +149,3 @@ pub fn validate(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use azihsm_ncrypt::p1363_to_der;
-
-    #[test]
-    fn p1363_conversion_has_stable_der_shape() {
-        let signature = [1_u8; 64];
-        assert_eq!(
-            p1363_to_der(&signature).unwrap_or_else(|error| panic!("{error}")),
-            [
-                &[0x30, 0x44, 0x02, 0x20][..],
-                &[1; 32],
-                &[0x02, 0x20],
-                &[1; 32]
-            ]
-            .concat()
-        );
-    }
-}

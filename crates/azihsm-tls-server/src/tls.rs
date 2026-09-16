@@ -10,13 +10,13 @@ use rustls::{Error, SignatureAlgorithm, SignatureScheme};
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub struct AzihsmRustlsKey {
+pub(crate) struct AzihsmRustlsKey {
     session: Arc<AzihsmSession>,
     spki: Vec<u8>,
 }
 
 impl AzihsmRustlsKey {
-    pub fn new(session: Arc<AzihsmSession>, spki: Vec<u8>) -> Self {
+    pub(crate) fn new(session: Arc<AzihsmSession>, spki: Vec<u8>) -> Self {
         Self { session, spki }
     }
 }
@@ -74,7 +74,7 @@ impl KeyProvider for RejectPrivateKeys {
     }
 }
 
-pub fn build_server_config(identity: &PreparedIdentity) -> Result<Arc<ServerConfig>, Error> {
+pub(crate) fn build_server_config(identity: &PreparedIdentity) -> Result<Arc<ServerConfig>, Error> {
     build_config(
         identity.chain_der.clone(),
         Arc::new(AzihsmRustlsKey::new(
@@ -104,9 +104,9 @@ pub fn build_config(
     config.send_tls13_tickets = 0;
     config.max_early_data_size = 0;
     config.send_half_rtt_data = false;
-    tracing::info!(
-        event = "rustls_configuration_completed",
-        message = "Configured one-way TLS 1.3: the server sends the leaf certificate, clients trust the root independently, and AziHSM signs CertificateVerify."
+    azihsm_ca_client::info_event(
+        "rustls_configuration_completed",
+        "Configured one-way TLS 1.3: the server sends the leaf certificate, clients trust the root independently, and AziHSM signs CertificateVerify.",
     );
     Ok(Arc::new(config))
 }

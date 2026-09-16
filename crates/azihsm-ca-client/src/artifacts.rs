@@ -66,10 +66,9 @@ pub fn create(args: CreateArgs) -> Result<()> {
     let finalize_marker = args.output_dir.join(FINALIZE_STARTED);
     let key = match provider.open_key(&staging.key_name) {
         Ok(key) if finalize_marker.exists() => {
-            tracing::info!(
-                event = "key_recovery_started",
-                message =
-                    "Recovering the same finalized named key from its durable staging record."
+            crate::info_event(
+                "key_recovery_started",
+                "Recovering the same finalized named key from its durable staging record.",
             );
             key
         }
@@ -81,9 +80,9 @@ pub fn create(args: CreateArgs) -> Result<()> {
         }
         Err(_) => {
             provider.require_absent(&staging.key_name)?;
-            tracing::info!(
-                event = "key_creation_started",
-                message = "Creating a named P-256 key inside AziHSM; private key bytes never leave the provider."
+            crate::info_event(
+                "key_creation_started",
+                "Creating a named P-256 key inside AziHSM; private key bytes never leave the provider.",
             );
             let key = provider.create_named_staged(&staging.key_name)?;
             files::publish_json(&finalize_marker, &staging)?;
@@ -98,23 +97,23 @@ pub fn create(args: CreateArgs) -> Result<()> {
                     ),
                 ));
             }
-            tracing::info!(
-                event = "key_finalized",
-                message = "The named AziHSM key is finalized and remains non-exportable."
+            crate::info_event(
+                "key_finalized",
+                "The named AziHSM key is finalized and remains non-exportable.",
             );
             key
         }
     };
     key.kat()?;
-    tracing::info!(
-        event = "public_key_export_started",
-        message = "Exporting only the public key so certificates and signatures can be verified."
+    crate::info_event(
+        "public_key_export_started",
+        "Exporting only the public key so certificates and signatures can be verified.",
     );
     let public_blob = key.public_blob()?;
     let spki = csr::spki_der(&public_blob)?;
-    tracing::info!(
-        event = "public_key_export_completed",
-        message = "The public key was exported; no private key bytes or handles were exposed."
+    crate::info_event(
+        "public_key_export_completed",
+        "The public key was exported; no private key bytes or handles were exposed.",
     );
     publish_public_key(&args.output_dir, &spki)?;
     let csr_der = load_or_create_csr(&args.output_dir, &staging, &key, &public_blob, &spki)?;
@@ -144,9 +143,9 @@ pub fn create(args: CreateArgs) -> Result<()> {
     );
     files::remove(&args.output_dir.join(FINALIZE_STARTED))?;
     files::remove(&args.output_dir.join(STAGING_METADATA))?;
-    tracing::info!(
-        event = "staging_cleanup_completed",
-        message = "Removed temporary recovery markers after durable public identity metadata was published."
+    crate::info_event(
+        "staging_cleanup_completed",
+        "Removed temporary recovery markers after durable public identity metadata was published.",
     );
     enroll_and_publish(
         &args.output_dir,
@@ -213,9 +212,9 @@ pub fn retry(args: RetryArgs) -> Result<()> {
 }
 
 fn log_key_open_completed() {
-    tracing::info!(
-        event = "key_open_completed",
-        message = "The recorded named AziHSM key handle was opened."
+    crate::info_event(
+        "key_open_completed",
+        "The recorded named AziHSM key handle was opened.",
     );
 }
 
@@ -229,10 +228,9 @@ fn verify_opened_key_identity(
             "stored public-key identity does not match the named key",
         ));
     }
-    tracing::info!(
-        event = "key_identity_verified",
-        message =
-            "The opened AziHSM key public SPKI matches both the stored DER and recorded digest."
+    crate::info_event(
+        "key_identity_verified",
+        "The opened AziHSM key public SPKI matches both the stored DER and recorded digest.",
     );
     Ok(())
 }
@@ -305,10 +303,9 @@ pub fn delete_key(args: DeleteKeyArgs) -> Result<()> {
         let record: DeletionRecord = files::read_json(&args.output_dir.join(DELETION_RECORD))?;
         validate_deletion_record(&record, &metadata, &intent)?;
         transcript::local_json("read", DELETION_RECORD, &record)?;
-        tracing::info!(
-            event = "key_deletion_completed",
-            message =
-                "The durable deletion record confirms the exact named key was already deleted."
+        crate::info_event(
+            "key_deletion_completed",
+            "The durable deletion record confirms the exact named key was already deleted.",
         );
         tracing::info!(
             event = "command_completed",
@@ -327,9 +324,9 @@ pub fn delete_key(args: DeleteKeyArgs) -> Result<()> {
         || provider.require_absent(&metadata.key_name),
         None,
     )?;
-    tracing::info!(
-        event = "key_deletion_completed",
-        message = "The exact named AziHSM key is deleted and its absence is durably recorded."
+    crate::info_event(
+        "key_deletion_completed",
+        "The exact named AziHSM key is deleted and its absence is durably recorded.",
     );
     tracing::info!(
         event = "command_completed",
@@ -398,9 +395,9 @@ where
             };
             files::publish_json(&output_dir.join(DELETION_INTENT), &intent)?;
             transcript::local_json("written", DELETION_INTENT, &intent)?;
-            tracing::info!(
-                event = "deletion_intent_published",
-                message = "Published an identity-bound deletion intent so an interrupted irreversible delete can be safely replayed."
+            crate::info_event(
+                "deletion_intent_published",
+                "Published an identity-bound deletion intent so an interrupted irreversible delete can be safely replayed.",
             );
             fail_deletion(fault, DeletionFault::AfterIntent)?;
             intent
@@ -408,9 +405,9 @@ where
     };
 
     if inspect()? {
-        tracing::info!(
-            event = "key_deletion_started",
-            message = "Irreversibly deleting the exact named key after its public identity and confirmation matched."
+        crate::info_event(
+            "key_deletion_started",
+            "Irreversibly deleting the exact named key after its public identity and confirmation matched.",
         );
         delete()?;
         fail_deletion(fault, DeletionFault::AfterDelete)?;
@@ -625,9 +622,9 @@ fn publish_new_staging(args: &CreateArgs) -> Result<StagingRecord> {
     };
     files::publish_json(&args.output_dir.join(STAGING_METADATA), &staging)?;
     transcript::local_json("written", STAGING_METADATA, &staging)?;
-    tracing::info!(
-        event = "staging_record_published",
-        message = "Published recoverable public staging metadata before finalizing the named key."
+    crate::info_event(
+        "staging_record_published",
+        "Published recoverable public staging metadata before finalizing the named key.",
     );
     Ok(staging)
 }
@@ -644,9 +641,9 @@ fn load_or_create_csr(
     let (csr_der, generated) = if path.exists() {
         (files::read_bounded(&path, 16_384)?, false)
     } else {
-        tracing::info!(
-            event = "csr_generation_started",
-            message = "Building a public CSR and signing its proof of possession with the non-exportable AziHSM key."
+        crate::info_event(
+            "csr_generation_started",
+            "Building a public CSR and signing its proof of possession with the non-exportable AziHSM key.",
         );
         let bytes = csr::build(
             key,
@@ -671,14 +668,14 @@ fn load_or_create_csr(
 fn validate_csr_and_log(generated: bool, validate: impl FnOnce() -> Result<()>) -> Result<()> {
     validate()?;
     if generated {
-        tracing::info!(
-            event = "csr_generation_completed",
-            message = "The generated CSR proof of possession is valid and contains only the requested identity fields."
+        crate::info_event(
+            "csr_generation_completed",
+            "The generated CSR proof of possession is valid and contains only the requested identity fields.",
         );
     } else {
-        tracing::info!(
-            event = "csr_validation_completed",
-            message = "The existing CSR was reused after its proof of possession and requested identity fields were validated."
+        crate::info_event(
+            "csr_validation_completed",
+            "The existing CSR was reused after its proof of possession and requested identity fields were validated.",
         );
     }
     Ok(())
@@ -856,14 +853,14 @@ pub fn load_request(output_dir: &Path) -> Result<RequestMetadata> {
 }
 
 fn open_provider() -> Result<AzihsmProvider> {
-    tracing::info!(
-        event = "provider_open_started",
-        message = "Opening the current-user AziHSM key storage provider."
+    crate::info_event(
+        "provider_open_started",
+        "Opening the current-user AziHSM key storage provider.",
     );
     let provider = AzihsmProvider::open_named(PROVIDER_NAME)?;
-    tracing::info!(
-        event = "provider_open_completed",
-        message = "The AziHSM provider is open for named-key operations without software fallback."
+    crate::info_event(
+        "provider_open_completed",
+        "The AziHSM provider is open for named-key operations without software fallback.",
     );
     Ok(provider)
 }

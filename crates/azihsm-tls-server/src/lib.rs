@@ -5,31 +5,29 @@
 #[cfg(not(windows))]
 compile_error!("azihsm-tls-server is Windows-only");
 
-mod ca_cli;
-pub mod cli;
+mod cli;
 pub mod frame;
 mod identity;
-pub mod logging;
 pub mod server;
 pub mod tls;
-mod workflow;
 
 use crate::identity::{
     ServerPrepareOptions, delete_server_key, prepare_server_identity, show_server_identity,
 };
-pub use azihsm_ca_client::transcript;
-pub use azihsm_ncrypt::{Error, ErrorClass, Result};
+use azihsm_ca_client::validation::validate_sans;
+use azihsm_ca_client::{init_logging, transcript};
+use azihsm_ncrypt::{Error, ErrorClass, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use time::OffsetDateTime;
 
 pub fn main_entry() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    logging::init()?;
+    init_logging()?;
     transcript::private_key_notice();
     match cli.command {
         Command::Run(args) => {
-            ca_cli::validate_sans(&args.dns, &args.ip)?;
+            validate_sans(&args.dns, &args.ip)?;
             tracing::info!(
                 event = "command_started",
                 command = "run",

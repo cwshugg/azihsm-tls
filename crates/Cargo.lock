@@ -207,7 +207,6 @@ dependencies = [
  "azihsm-ncrypt",
  "clap",
  "rcgen",
- "ring",
  "serde",
  "serde_json",
  "time",
@@ -229,6 +228,7 @@ dependencies = [
  "serde_json",
  "time",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "windows-sys 0.61.2",
  "x509-parser",
@@ -239,12 +239,8 @@ name = "azihsm-ca-demo"
 version = "0.1.0"
 dependencies = [
  "azihsm-ca-client",
- "azihsm-ncrypt",
  "clap",
- "pem",
- "time",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -265,7 +261,6 @@ dependencies = [
  "azihsm-ncrypt",
  "base64 0.22.1",
  "clap",
- "pem",
  "rcgen",
  "rustls",
  "serde",
@@ -273,7 +268,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
  "x509-parser",
 ]
 
