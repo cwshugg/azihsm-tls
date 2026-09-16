@@ -8,6 +8,8 @@ constructs certificates through a custom NCrypt signing adapter, and
 x509-parser/ring provide parsing, hashing, randomness, identifiers, and public
 verification. There is no software CA signing fallback. The product does not
 use OpenSSL, and OpenSSL is prohibited for product operation and validation.
+For build, initialization, enrollment, restart, and recovery procedures, see
+the [CA server operator guide](../../docs/ca-server-usage.md).
 
 ## Accepted demonstration risks
 
