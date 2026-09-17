@@ -19,6 +19,7 @@ const SERVER_PREFIX: &[u8] = b"azihsm-tls-server: ";
 
 struct Chain {
     root_pem: String,
+    root_der: CertificateDer<'static>,
     leaf_der: CertificateDer<'static>,
     leaf_key_der: Vec<u8>,
 }
@@ -48,6 +49,7 @@ fn build_chain() -> Chain {
 
     Chain {
         root_pem: root.pem(),
+        root_der: root.der().clone(),
         leaf_der: leaf.der().clone(),
         leaf_key_der: leaf_key.serialize_der(),
     }
@@ -128,6 +130,19 @@ fn valid_server_cert_chains_to_trusted_root() {
     let _ = std::fs::remove_file(&path);
     let response = response.expect("handshake should succeed");
     assert_eq!(response, "azihsm-tls-server: ping from client");
+}
+
+#[test]
+fn der_root_is_accepted_without_conversion() {
+    let chain = build_chain();
+    let path = std::env::temp_dir().join(format!("tls-client-root-{}.der", std::process::id()));
+    std::fs::write(&path, chain.root_der.as_ref()).expect("write root");
+    let port = spawn_server(chain.leaf_der, chain.leaf_key_der, framed_echo);
+
+    let response = run(&format!("127.0.0.1:{port}"), &path, SERVER_NAME, "der ping");
+    let _ = std::fs::remove_file(&path);
+    let response = response.expect("handshake with DER root should succeed");
+    assert_eq!(response, "azihsm-tls-server: der ping");
 }
 
 #[test]

@@ -56,18 +56,16 @@ $ServerExe = '.\crates\target\x86_64-pc-windows-msvc\release\azihsm-tls-server.e
 The server creates its own named key in AziHSM, sends a CSR to the CA, and
 serves TLS. The CA terminal logs `enrollment_accepted`.
 
-## 3. Export the CA root as PEM (terminal 3)
+## 3. Provide the CA root to the client (terminal 3)
 
-The client validates against a PEM anchor; the CA writes DER, so convert once:
-
-```powershell
-certutil -encode E:\azihsm-demo\ca-state\root.der E:\azihsm-demo\ca-root.pem
-```
+The client accepts the CA root as DER or PEM, so the CA's `root.der` is used
+directly. On a single machine it is already local. Across machines, copy
+`root.der` from the CA machine to the client.
 
 ## 4. Run the client (terminal 3)
 
 ```powershell
-.\crates\target\x86_64-pc-windows-msvc\release\azihsm-tls-client.exe --connect 127.0.0.1:8443 --ca-root E:\azihsm-demo\ca-root.pem --server-name server.demo --message hello
+.\crates\target\x86_64-pc-windows-msvc\release\azihsm-tls-client.exe --connect 127.0.0.1:8443 --ca-root E:\azihsm-demo\ca-state\root.der --server-name server.demo --message hello
 ```
 
 Expected:
@@ -98,7 +96,8 @@ azihsm-tls-server: hello
   trust), issuance journals, and audit records.
 * **Server state** (`E:\azihsm-demo\tls-server`): the cached issued certificate
   and identity metadata.
-* **Client trust anchor**: `E:\azihsm-demo\ca-root.pem`, produced in step 3.
+* **Client trust anchor**: the CA's `root.der` (DER or PEM both work), passed to
+  the client with `--ca-root`.
 
 ## Cleanup
 
