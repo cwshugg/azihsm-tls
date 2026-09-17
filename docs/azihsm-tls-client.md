@@ -57,6 +57,13 @@ class-specific code:
 | 4 | TLS setup error |
 | 5 | Trust error (bad CA root, or the server did not chain to it) |
 
+## Wire protocol
+
+After the TLS handshake the client exchanges one length-prefixed frame: a 4-byte
+big-endian length followed by the payload, in both directions. This matches the
+`azihsm-tls-server` framing, so the client talks to it without any adapter. The
+server echoes the request back with an `azihsm-tls-server: ` prefix.
+
 ## Security boundary
 
 * The client trusts **only** the certificates in `--ca-root`; the system trust

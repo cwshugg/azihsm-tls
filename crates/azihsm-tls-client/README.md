@@ -22,6 +22,13 @@ azihsm-tls-client --connect HOST:PORT --ca-root ROOT_PEM --server-name NAME [--m
 * `--server-name` - expected server name, used for SNI and certificate validation.
 * `--message` - text to send after the handshake (defaults to a fixed greeting).
 
+## Wire protocol
+
+After the handshake, the message is sent as a single length-prefixed frame (a
+4-byte big-endian length followed by the payload), and the reply is read the
+same way. This matches the `azihsm-tls-server` framing, so the client
+interoperates with it directly.
+
 ## Exit codes
 
 | Code | Meaning |

@@ -15,6 +15,7 @@ use std::thread;
 use time::{Duration, OffsetDateTime};
 
 const SERVER_NAME: &str = "server.test";
+const SERVER_PREFIX: &[u8] = b"azihsm-tls-server: ";
 
 struct Chain {
     root_pem: String,
@@ -52,8 +53,13 @@ fn build_chain() -> Chain {
     }
 }
 
-/// Start a single-shot TLS echo server; returns the bound port.
-fn spawn_echo_server(leaf_der: CertificateDer<'static>, leaf_key_der: Vec<u8>) -> u16 {
+/// Start a single-shot TLS server that runs `handler` after accepting one
+/// connection; returns the bound port.
+fn spawn_server(
+    leaf_der: CertificateDer<'static>,
+    leaf_key_der: Vec<u8>,
+    handler: fn(&mut StreamOwned<ServerConnection, TcpStream>) -> std::io::Result<()>,
+) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key_der));
@@ -68,18 +74,39 @@ fn spawn_echo_server(leaf_der: CertificateDer<'static>, leaf_key_der: Vec<u8>) -
 
     thread::spawn(move || {
         if let Ok((socket, _)) = listener.accept() {
-            let _ = serve_once(config, socket);
+            let connection = ServerConnection::new(config).expect("server connection");
+            let mut tls = StreamOwned::new(connection, socket);
+            let _ = handler(&mut tls);
         }
     });
     port
 }
 
-fn serve_once(config: Arc<ServerConfig>, socket: TcpStream) -> std::io::Result<()> {
-    let connection = ServerConnection::new(config).expect("server connection");
-    let mut tls = StreamOwned::new(connection, socket);
-    let mut buffer = [0_u8; 1024];
-    let read = tls.read(&mut buffer)?;
-    tls.write_all(&buffer[..read])?;
+fn read_request(tls: &mut StreamOwned<ServerConnection, TcpStream>) -> std::io::Result<Vec<u8>> {
+    let mut header = [0_u8; 4];
+    tls.read_exact(&mut header)?;
+    let length = u32::from_be_bytes(header) as usize;
+    let mut request = vec![0_u8; length];
+    tls.read_exact(&mut request)?;
+    Ok(request)
+}
+
+/// Reply with a framed "azihsm-tls-server: " + request, mirroring the real server.
+fn framed_echo(tls: &mut StreamOwned<ServerConnection, TcpStream>) -> std::io::Result<()> {
+    let request = read_request(tls)?;
+    let mut response = SERVER_PREFIX.to_vec();
+    response.extend_from_slice(&request);
+    tls.write_all(&(response.len() as u32).to_be_bytes())?;
+    tls.write_all(&response)?;
+    tls.conn.send_close_notify();
+    tls.flush()?;
+    Ok(())
+}
+
+/// Declare a response frame far larger than the client will accept.
+fn oversized_header(tls: &mut StreamOwned<ServerConnection, TcpStream>) -> std::io::Result<()> {
+    read_request(tls)?;
+    tls.write_all(&u32::MAX.to_be_bytes())?;
     tls.conn.send_close_notify();
     tls.flush()?;
     Ok(())
@@ -90,7 +117,7 @@ fn valid_server_cert_chains_to_trusted_root() {
     let chain = build_chain();
     let path = std::env::temp_dir().join(format!("tls-client-root-ok-{}.pem", std::process::id()));
     std::fs::write(&path, &chain.root_pem).expect("write root");
-    let port = spawn_echo_server(chain.leaf_der, chain.leaf_key_der);
+    let port = spawn_server(chain.leaf_der, chain.leaf_key_der, framed_echo);
 
     let response = run(
         &format!("127.0.0.1:{port}"),
@@ -100,7 +127,7 @@ fn valid_server_cert_chains_to_trusted_root() {
     );
     let _ = std::fs::remove_file(&path);
     let response = response.expect("handshake should succeed");
-    assert_eq!(response, "ping from client");
+    assert_eq!(response, "azihsm-tls-server: ping from client");
 }
 
 #[test]
@@ -110,10 +137,24 @@ fn untrusted_root_is_rejected() {
     // Client trusts a DIFFERENT root than the one that signed the server leaf.
     let path = std::env::temp_dir().join(format!("tls-client-root-bad-{}.pem", std::process::id()));
     std::fs::write(&path, &other.root_pem).expect("write root");
-    let port = spawn_echo_server(served.leaf_der, served.leaf_key_der);
+    let port = spawn_server(served.leaf_der, served.leaf_key_der, framed_echo);
 
     let result = run(&format!("127.0.0.1:{port}"), &path, SERVER_NAME, "ping");
     let _ = std::fs::remove_file(&path);
     let error = result.expect_err("untrusted server must be rejected");
     assert_eq!(error.code(), ExitCode::Trust);
+}
+
+#[test]
+fn oversized_response_frame_is_rejected() {
+    let chain = build_chain();
+    let path =
+        std::env::temp_dir().join(format!("tls-client-oversized-{}.pem", std::process::id()));
+    std::fs::write(&path, &chain.root_pem).expect("write root");
+    let port = spawn_server(chain.leaf_der, chain.leaf_key_der, oversized_header);
+
+    let result = run(&format!("127.0.0.1:{port}"), &path, SERVER_NAME, "ping");
+    let _ = std::fs::remove_file(&path);
+    let error = result.expect_err("oversized response frame must be rejected");
+    assert_eq!(error.code(), ExitCode::Io);
 }

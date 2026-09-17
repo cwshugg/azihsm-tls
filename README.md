@@ -27,7 +27,7 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 | Implement TLS Server | Done | See [`azihsm-tls-server`](crates/azihsm-tls-server) |
 | Test TLS-Server-to-Mock-CA certificate issuing | Done | See the [TLS server guide](docs/azihsm-tls-server.md) |
 | Implement TLS Client | Done | See [`azihsm-tls-client`](crates/azihsm-tls-client) |
-| Test TLS-Client-to-TLS-Server communication | TODO | |
+| Test TLS-Client-to-TLS-Server communication | Done | See the [TLS client guide](docs/azihsm-tls-client.md) |
 | Test full workflow | TODO | |
 | Record demonstration of full workflow | TODO | |
 
