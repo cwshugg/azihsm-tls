@@ -26,7 +26,7 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 | Initialize named TLS keys | Done | See [`keytool`](crates/keytool) |
 | Implement TLS Server | Done | See [`azihsm-tls-server`](crates/azihsm-tls-server) |
 | Test TLS-Server-to-Mock-CA certificate issuing | Done | See the [TLS server guide](docs/azihsm-tls-server.md) |
-| Implement TLS Client | TODO | |
+| Implement TLS Client | Done | See [`azihsm-tls-client`](crates/azihsm-tls-client) |
 | Test TLS-Client-to-TLS-Server communication | TODO | |
 | Test full workflow | TODO | |
 | Record demonstration of full workflow | TODO | |
@@ -41,6 +41,7 @@ This repo contains multiple Rust crates:
 * [`azihsm-ncrypt`](crates/azihsm-ncrypt) - A helper crate implementing shared code to interact with the AziHSM KSP in Windows.
 * [`azihsm-tls-server`](crates/azihsm-tls-server) - A TLS 1.3 framed echo server whose persistent private key remains in AziHSM.
 * [`keytool`](crates/keytool) - A CLI that initializes and exercises named AziHSM TLS keys (the key-management foundation for the TLS Server).
+* [`azihsm-tls-client`](crates/azihsm-tls-client) - A TLS client that validates a server against a specific CA root and exchanges a message (no AziHSM dependency).
 
 ## Quick Start
 

@@ -1,0 +1,38 @@
+[package]
+name = "azihsm-tls-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Minimal TLS client that validates a server against a specific CA root"
+repository = "https://github.com/cwshugg/azihsm-tls"
+
+[dependencies]
+clap = { version = "=4.6.7", default-features = false, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+rustls = { version = "=0.23.45", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = "=2.2.0"
+rustls-pki-types = "=1.15.1"
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = [
+    "fmt",
+    "std",
+] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = [
+    "crypto",
+    "ring",
+    "pem",
+] }
+time = { version = "=0.3.55", default-features = false, features = ["std"] }
