@@ -99,6 +99,34 @@ azihsm-tls-server: hello
 * **Client trust anchor**: the CA's `root.der` (DER or PEM both work), passed to
   the client with `--ca-root`.
 
+## Optional: verify the Windows Certificate Store path (manually checked)
+
+The server key is also usable through the native Windows cert store / Schannel
+path. No extra generation is needed: `leaf.der` is created automatically during
+step 2, when the server enrolls (CSR -> CA issues the certificate -> the server
+writes `leaf.der`, `root.der`, and `chain.pem` to its state directory).
+Verified manually on the AziHSM VM:
+
+```powershell
+$Leaf = (Get-ChildItem -Recurse E:\azihsm-demo\tls-server -Filter leaf.der | Select-Object -First 1).FullName
+certutil -addstore -user My $Leaf
+certutil -repairstore -user My <thumbprint>
+$cert = Get-Item Cert:\CurrentUser\My\<thumbprint>
+$ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($cert)
+$data = [Text.Encoding]::UTF8.GetBytes("cert-store sign test")
+$sig = $ecdsa.SignData($data, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+$pub = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($cert)
+$pub.VerifyData($data, $sig, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+```
+
+`leaf.der` is the certificate the CA issued for the server in step 2; take the
+`<thumbprint>` from the `certutil -addstore` output. `repairstore` binds the
+cert to the AziHSM key (`Key Container` + AziHSM provider). `GetECDsaPrivateKey`
++ `SignData` then sign through `CryptAcquireCertificatePrivateKey` ->
+`NCryptSignHash` inside AziHSM; `VerifyData` returns `True`. certutil's own
+`Encryption test FAILED` is a known false alarm for ECC KSP keys and does not
+reflect real signing.
+
 ## Cleanup
 
 Stop the CA and server with Ctrl+C, then remove the demo directory:
