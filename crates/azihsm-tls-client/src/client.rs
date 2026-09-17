@@ -8,7 +8,9 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::sync::Arc;
 
-const MAX_RESPONSE: usize = 64 * 1024;
+// Bounds a server-declared frame length: azihsm-tls-server caps requests at
+// 1 MiB, so a response (request plus prefix) always fits well within 2 MiB.
+const MAX_FRAME: usize = 2 * 1024 * 1024;
 
 /// Connect to `connect` (host:port), validate the server strictly against the
 /// certificates in `ca_root`, send `message`, and return the server's reply.
@@ -35,15 +37,40 @@ pub fn run(connect: &str, ca_root: &Path, server_name: &str, message: &str) -> R
     })?;
     let mut tls = StreamOwned::new(connection, socket);
 
-    tls.write_all(message.as_bytes())
+    write_frame(&mut tls, message.as_bytes())?;
+    let response = read_frame(&mut tls)?;
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Send one length-prefixed frame: a 4-byte big-endian length then the payload,
+/// matching the `azihsm-tls-server` wire protocol.
+fn write_frame(tls: &mut impl Write, payload: &[u8]) -> Result<()> {
+    let length = u32::try_from(payload.len())
+        .map_err(|_| Error::new(ExitCode::Usage, "message is larger than 4 GiB"))?;
+    tls.write_all(&length.to_be_bytes())
+        .map_err(|error| classify_io("write", error))?;
+    tls.write_all(payload)
         .map_err(|error| classify_io("write", error))?;
     tls.flush().map_err(|error| classify_io("flush", error))?;
+    Ok(())
+}
 
-    let mut buffer = Vec::new();
-    tls.take(MAX_RESPONSE as u64)
-        .read_to_end(&mut buffer)
+/// Read one length-prefixed frame and return its payload.
+fn read_frame(tls: &mut impl Read) -> Result<Vec<u8>> {
+    let mut header = [0_u8; 4];
+    tls.read_exact(&mut header)
         .map_err(|error| classify_io("read", error))?;
-    Ok(String::from_utf8_lossy(&buffer).into_owned())
+    let length = u32::from_be_bytes(header) as usize;
+    if length > MAX_FRAME {
+        return Err(Error::new(
+            ExitCode::Io,
+            format!("response frame of {length} bytes exceeds the {MAX_FRAME} byte limit"),
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    tls.read_exact(&mut payload)
+        .map_err(|error| classify_io("read", error))?;
+    Ok(payload)
 }
 
 fn load_roots(ca_root: &Path) -> Result<RootCertStore> {
