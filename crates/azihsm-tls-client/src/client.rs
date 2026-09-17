@@ -39,6 +39,9 @@ pub fn run(connect: &str, ca_root: &Path, server_name: &str, message: &str) -> R
 
     write_frame(&mut tls, message.as_bytes())?;
     let response = read_frame(&mut tls)?;
+    // Close cleanly so the server sees a graceful shutdown, not an unexpected EOF.
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
