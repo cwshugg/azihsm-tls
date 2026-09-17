@@ -1,7 +1,7 @@
 // Copyright (C) Microsoft Corporation. All rights reserved.
 
 use crate::error::{Error, ExitCode, Result};
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
@@ -77,25 +77,29 @@ fn read_frame(tls: &mut impl Read) -> Result<Vec<u8>> {
 }
 
 fn load_roots(ca_root: &Path) -> Result<RootCertStore> {
-    let pem = std::fs::read(ca_root).map_err(|error| {
+    let bytes = std::fs::read(ca_root).map_err(|error| {
         Error::new(ExitCode::Io, format!("read {}: {error}", ca_root.display()))
     })?;
-    let mut reader = BufReader::new(&pem[..]);
     let mut roots = RootCertStore::empty();
-    let mut added = 0_usize;
-    for entry in rustls_pemfile::certs(&mut reader) {
-        let cert = entry
-            .map_err(|error| Error::new(ExitCode::Trust, format!("parse CA root: {error}")))?;
+
+    // Accept a PEM bundle, or fall back to a single DER certificate so the CA's
+    // root.der can be used directly without conversion.
+    let pem_certs = {
+        let mut reader = BufReader::new(&bytes[..]);
+        rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap_or_default()
+    };
+    if pem_certs.is_empty() {
         roots
-            .add(cert)
-            .map_err(|error| Error::new(ExitCode::Trust, format!("add CA root: {error}")))?;
-        added += 1;
-    }
-    if added == 0 {
-        return Err(Error::new(
-            ExitCode::Trust,
-            "CA root file contains no certificates",
-        ));
+            .add(CertificateDer::from(bytes))
+            .map_err(|error| Error::new(ExitCode::Trust, format!("add CA root (DER): {error}")))?;
+    } else {
+        for cert in pem_certs {
+            roots
+                .add(cert)
+                .map_err(|error| Error::new(ExitCode::Trust, format!("add CA root: {error}")))?;
+        }
     }
     Ok(roots)
 }
