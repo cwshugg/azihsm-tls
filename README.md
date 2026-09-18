@@ -29,7 +29,7 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 | Implement TLS Client | Done | See [`azihsm-tls-client`](crates/azihsm-tls-client) |
 | Test TLS-Client-to-TLS-Server communication | Done | See the [TLS client guide](docs/azihsm-tls-client.md) |
 | Test full workflow | Done | |
-| Record demonstration of full workflow | TODO | |
+| Demonstrate full workflow | TODO | |
 
 ## Rust Crates
 
@@ -50,6 +50,8 @@ This project implements three major components, all of which rely on AziHSM to m
 1. **AziHSM CA Server** - A simple, mock Certificate Authority that uses an AziHSM key to produce its own root certificate, and to produce signed leaf certificates for requesters.
 2. **AziHSM TLS Server** - A simple TLS server that uses an AziHSM key for TLS communications, and contacts the CA server to receive a leaf certificate for its TLS key.
 3. **AziHSM TLS Client** - A simple TLS client that communicates with the TLS server to establish a secure channel and pass messages back and forth.
+
+(If you would like to see diagrams depicting the full process, please see the [images stored under `docs/.images/`](docs/.images).
 
 ### CA Initialization & Root Self-Signing
 
