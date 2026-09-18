@@ -7,6 +7,18 @@ AziHSM supports a variety of customer scenarios.
 However, throughout our testing and development, one scenario we haven't visited is using AziHSM to manage keys for a [**Transport Layer Security**](https://www.cloudflare.com/learning/ssl/transport-layer-security-tls/) (**TLS**) server.
 This project aims to explore that scenario; this repository contains the files and code from our 2026 hackathon project.
 
+## Contributors
+
+Thanks to all the contributors to this project!
+
+* Connor Shugg
+* Dmitrii Makarov
+* Milan Živadinović
+* Zijie Wu
+* Ming-Wei Shih
+* Radhika Jandhyala
+* Pushkar Chitnis
+
 ## Project Agenda
 
 The end goal of this project is to demonstrate a three-VM setup, where each VM uses a separate AziHSM device to enable TLS communication:
