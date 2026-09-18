@@ -204,6 +204,16 @@ sequenceDiagram
 
 </details>
 
+## Future Directions
+
+The most lucrative future direction for this project is to manage the TLS certificates directly through the Windows certificate management system.
+Currently, our approach uses [rustls](https://github.com/rustls/rustls), a Rust crate that implements TLS and manages certificates on its own.
+
+Our testing environment could not take the Windows-native approach, because we used a custom, unsigned build of the AziHSM KSP ("Key Storage Provider") library that supports named/persistent keys (a feature we are actively developing).
+The unsigned nature of the KSP DLL (`C:\Windows\System32\azihsmksp.dll`) meant that it was flagged and denied for certificate usage by the [Local Security Authority](https://support.microsoft.com/en-us/windows/security/windows-security/device-security-in-the-windows-security-app#bkmk_lsa-protection) system.
+
+That being said, the main goal of the project was still demonstrated: TLS keys and CA keys were all stored and used within the hardware trust boundary of the AziHSM device, demonstrating that AziHSM can indeed be used to establish a TLS secure channel.
+
 ## Quick Start
 
 On Windows with Rust 1.88+ and the AziHSM KSP, build both required binaries:
