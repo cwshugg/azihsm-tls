@@ -43,7 +43,7 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 | Implement TLS Client | Done | See [`azihsm-tls-client`](crates/azihsm-tls-client) |
 | Test TLS-Client-to-TLS-Server communication | Done | See the [TLS client guide](docs/azihsm-tls-client.md) |
 | Test full workflow | Done | |
-| Demonstrate full workflow | TODO | |
+| Demonstrate full workflow | Done; see [this video](docs/.images/demonstration.mp4) | |
 
 ## Rust Crates
 
@@ -222,6 +222,8 @@ sequenceDiagram
 
 ## Future Directions
 
+### Windows Certificate Management
+
 The most lucrative future direction for this project is to manage the TLS certificates directly through the Windows certificate management system.
 Currently, our approach uses [rustls](https://github.com/rustls/rustls), a Rust crate that implements TLS and manages certificates on its own.
 
@@ -229,6 +231,10 @@ Our testing environment could not take the Windows-native approach, because we u
 The unsigned nature of the KSP DLL (`C:\Windows\System32\azihsmksp.dll`) meant that it was flagged and denied for certificate usage by the [Local Security Authority](https://support.microsoft.com/en-us/windows/security/windows-security/device-security-in-the-windows-security-app#bkmk_lsa-protection) system.
 
 That being said, the main goal of the project was still demonstrated: TLS keys and CA keys were all stored and used within the hardware trust boundary of the AziHSM device, demonstrating that AziHSM can indeed be used to establish a TLS secure channel.
+
+### Azure Key Vault Certificates
+
+Another direction to pursue is the usage of [Key Vault certificates](https://learn.microsoft.com/en-us/azure/key-vault/certificates/certificate-scenarios), instead of standing up our own CA server.
 
 ## Quick Start
 
