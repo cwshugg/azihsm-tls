@@ -19,8 +19,6 @@ Thanks to all the contributors to this project!
 * Radhika Jandhyala
 * Pushkar Chitnis
 
-To view a short video on this project, please see [this file](docs/.images/demonstration.mp4).
-
 ## Project Agenda
 
 The end goal of this project is to demonstrate a three-VM setup, where each VM uses a separate AziHSM device to enable TLS communication:
@@ -43,7 +41,7 @@ The end goal of this project is to demonstrate a three-VM setup, where each VM u
 | Implement TLS Client | Done | See [`azihsm-tls-client`](crates/azihsm-tls-client) |
 | Test TLS-Client-to-TLS-Server communication | Done | See the [TLS client guide](docs/azihsm-tls-client.md) |
 | Test full workflow | Done | |
-| Demonstrate full workflow | Done; see [this video](docs/.images/demonstration.mp4) | |
+| Demonstrate full workflow | Done | |
 
 ## Rust Crates
 
